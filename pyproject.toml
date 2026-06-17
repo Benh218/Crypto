@@ -1,0 +1,15 @@
+[project]
+name = "btc-tools"
+version = "0.1.0"
+description = "Bitcoin blockchain data fetcher & dormant coin scanner"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.28",
+]
+
+[project.scripts]
+btc-tools = "btc_tools.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["btc_tools*"]
