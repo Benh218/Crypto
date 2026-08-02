@@ -38,6 +38,47 @@ python claim_radar.py top -n 10 --min 50
 Handles every shard value shape (ETH floats, decimal strings, token/NFT holder dicts), checksummed or raw
 addresses, and leading-zero addresses. Uses the standard library only (no pip installs).
 
+## Claim Radar Notifier (Phase 2)
+
+The `watch` command monitors two things and alerts on changes:
+
+1. **Index updates** — new data commits to the ForgottenETH repo (new protocols/balances added)
+2. **Contract funding** — polls watched recovery contracts' ETH balances on public RPCs and alerts
+   on inbound funding (`+N ETH`) or claims/sweeps (`-N ETH`)
+
+```bash
+# Write the default watch config (edit ~/.claim_radar/watch_config.json as needed)
+python claim_radar.py watch --init
+
+# Check index + funding once (cron-friendly)
+python claim_radar.py watch --index --funding
+
+# Daemon loop every 300s, with a notification hook
+python claim_radar.py watch --index --funding --interval 300 \
+  --notify-cmd 'curl -s -X POST -d "{\"text\":\"{message}\"}" <webhook-url>'
+
+# Quiet mode: log to ~/.claim_radar/alerts.log, print nothing
+python claim_radar.py watch --funding --quiet
+```
+
+**Watch config** (`~/.claim_radar/watch_config.json`):
+
+```json
+{
+  "rpc": "https://eth.drpc.org",
+  "fallback_rpcs": ["https://ethereum-rpc.publicnode.com", "https://1rpc.io/eth"],
+  "contracts": {
+    "0xbb9bc244d798123fde783fcc1c72d3bb8c189413": {
+      "label": "The DAO WithdrawDAO wrapper",
+      "min_delta_eth": 0.01
+    }
+  }
+}
+```
+
+State (baseline balances, last index commit) is persisted to `~/.claim_radar/state.json`, and all
+alerts are appended to `~/.claim_radar/alerts.log`. The notifier reads public data only.
+
 ## Quick Start
 
 ```bash
