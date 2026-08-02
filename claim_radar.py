@@ -325,13 +325,275 @@ def notify(alerts, notify_cmd=None, quiet=False):
             print(f"[notify] command failed: {e}", file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 — Claim executor (read-only simulation + unsigned tx generation)
+# ---------------------------------------------------------------------------
+
+KECCAK_ROUNDS = 24
+KECCAK_RC = [
+    0x0000000000000001, 0x0000000000008082, 0x800000000000808a, 0x8000000080008000,
+    0x000000000000808b, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
+    0x000000000000008a, 0x0000000000000088, 0x0000000080008009, 0x000000008000000a,
+    0x000000008000808b, 0x800000000000008b, 0x8000000000008089, 0x8000000000008003,
+    0x8000000000008002, 0x8000000000000080, 0x000000000000800a, 0x800000008000000a,
+    0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
+]
+KECCAK_RHO = [
+    [0, 36, 3, 41, 18], [1, 44, 10, 45, 2], [62, 6, 43, 15, 61],
+    [28, 55, 25, 21, 56], [27, 20, 39, 8, 14],
+]
+KECCAK_MASK64 = (1 << 64) - 1
+KECCAK_RATE = 136
+
+
+def _keccak_rol(v, n):
+    n %= 64
+    return ((v << n) | (v >> (64 - n))) & KECCAK_MASK64
+
+
+def _keccak_f(state):
+    for rc in KECCAK_RC:
+        c = [state[x][0] ^ state[x][1] ^ state[x][2] ^ state[x][3] ^ state[x][4] for x in range(5)]
+        d = [c[(x - 1) % 5] ^ _keccak_rol(c[(x + 1) % 5], 1) for x in range(5)]
+        for x in range(5):
+            for y in range(5):
+                state[x][y] ^= d[x]
+        b = [[0] * 5 for _ in range(5)]
+        for x in range(5):
+            for y in range(5):
+                b[y][(2 * x + 3 * y) % 5] = _keccak_rol(state[x][y], KECCAK_RHO[x][y])
+        for x in range(5):
+            for y in range(5):
+                state[x][y] = b[x][y] ^ ((~b[(x + 1) % 5][y]) & b[(x + 2) % 5][y])
+        state[0][0] ^= rc
+    return state
+
+
+def keccak256(data):
+    rate_bits = KECCAK_RATE * 8
+    padded = bytearray(data)
+    padded.append(0x01)
+    while (len(padded) * 8) % rate_bits != rate_bits - 8:
+        padded.append(0x00)
+    padded.append(0x80)
+    state = [[0] * 5 for _ in range(5)]
+    for off in range(0, len(padded), KECCAK_RATE):
+        block = padded[off:off + KECCAK_RATE]
+        for i in range(KECCAK_RATE // 8):
+            lane = int.from_bytes(block[i * 8:i * 8 + 8], "little")
+            state[i % 5][i // 5] ^= lane
+        _keccak_f(state)
+    out = bytearray()
+    for i in range(4):
+        lane = state[i % 5][i // 5]
+        out += lane.to_bytes(8, "little")
+    return bytes(out[:32])
+
+
+def selector(sig):
+    return keccak256(sig.encode())[:4]
+
+
+def encode_uint256(value):
+    return int(value).to_bytes(32, "big")
+
+
+def encode_address(addr):
+    clean = addr.lower().removeprefix("0x")
+    if len(clean) != 40:
+        raise ValueError(f"invalid address: {addr}")
+    return bytes.fromhex(clean).rjust(32, b"\x00")
+
+
+def encode_args(argtypes, args):
+    out = b""
+    for typ, arg in zip(argtypes, args):
+        if typ == "uint256":
+            out += encode_uint256(arg)
+        elif typ == "address":
+            out += encode_address(arg)
+        else:
+            raise ValueError(f"unsupported arg type: {typ}")
+    return out
+
+
+# Verified claim paths. 'amount_from' is a read path used to auto-resolve the
+# amount argument when --amount is not supplied.
+CLAIM_PATHS = {
+    "aave_v1": {
+        "name": "Aave v1 (aETH redeem)",
+        "contract": "0x3a3A65aAb0dd2A17E3F1947bA16138cd37d08c04",
+        "method": "redeem(uint256)",
+        "amount_from": {
+            "method": "balanceOf(address)",
+            "contract": "0x3a3A65aAb0dd2A17E3F1947bA16138cd37d08c04",
+        },
+        "note": "Burn aETH shares for ETH. Users call aETH.redeem(amount) to unwrap.",
+    },
+    "etherdelta": {
+        "name": "EtherDelta v2 (ETH withdraw)",
+        "contract": "0x8d12A197cB00D4747a1fe03395095ce2A5CC6819",
+        "method": "withdraw(uint256)",
+        "note": "Withdraw ETH deposit balance. Supply --amount (your mapped deposit).",
+    },
+}
+
+ABI_CACHE_DIR = os.path.join(CONFIG_DIR, "abi_cache")
+
+
+def fetch_abi(address):
+    os.makedirs(ABI_CACHE_DIR, exist_ok=True)
+    addr = address.lower()
+    cache = os.path.join(ABI_CACHE_DIR, addr + ".json")
+    if os.path.exists(cache):
+        with open(cache) as f:
+            return json.load(f)
+    url = f"https://eth.blockscout.com/api/v2/smart-contracts/{addr}"
+    data = http_json(url, headers={"User-Agent": "claim-radar/0.3"})
+    abi = data.get("abi") or []
+    with open(cache, "w") as f:
+        json.dump(abi, f, indent=1)
+    return abi
+
+
+class RevertError(RuntimeError):
+    pass
+
+
+def decode_revert(data):
+    if not (isinstance(data, str) and data.startswith("0x") and len(data) >= 10 and data[2:10] == "08c379a0"):
+        return None
+    body = bytes.fromhex(data[10:])
+    if len(body) < 64:
+        return None
+    length = int.from_bytes(body[32:64], "big")
+    return body[64:64 + length].decode(errors="replace")
+
+
+def rpc_eth(rpc, method, params):
+    last = None
+    for cand in [rpc] + DEFAULT_RPCS:
+        try:
+            res = http_json(cand, {"jsonrpc": "2.0", "method": method, "params": params, "id": 1})
+        except Exception as e:
+            last = e
+            continue
+        if "error" in res:
+            err = res["error"]
+            msg = err.get("data") or err.get("message", "rpc error")
+            reason = decode_revert(msg)
+            if reason is not None or (isinstance(err.get("data"), str) and "revert" in msg.lower()):
+                raise RevertError(f"execution reverted{': ' + reason if reason else ''}")
+            last = RuntimeError(f"{method} error: {err.get('message', 'unknown')}")
+            continue
+        return res["result"]
+    raise RuntimeError(f"{method} failed on all RPCs: {last}")
+
+
+def _hex(data):
+    return data if data.startswith("0x") else "0x" + data
+
+
+def eth_call(rpc, to, data, from_addr="0x0000000000000000000000000000000000000000"):
+    return rpc_eth(rpc, "eth_call", [{"to": to, "data": _hex(data), "from": from_addr}, "latest"])
+
+
+def eth_estimate_gas(rpc, to, data, from_addr):
+    return rpc_eth(rpc, "eth_estimateGas", [{"to": to, "data": _hex(data), "from": from_addr}])
+
+
+def resolve_amount(config, path, user, amount_eth):
+    if amount_eth is not None:
+        return int(amount_eth * 1e18)
+    af = path.get("amount_from")
+    if not af:
+        return None
+    data = selector(af["method"]) + encode_args(["address"], [user])
+    res = eth_call(config.get("rpc"), af["contract"], data.hex())
+    return int(res, 16)
+
+
+def make_unsigned_tx(config, path, user, amount_wei):
+    contract = path["contract"]
+    method = path["method"]
+    argtypes = [t.strip() for t in method[method.index("(") + 1:method.index(")")].split(",") if t.strip()]
+    data = selector(method) + encode_args(argtypes, [amount_wei])
+    from_addr = user.lower()
+    rpc = config.get("rpc")
+    nonce = int(rpc_eth(rpc, "eth_getTransactionCount", [from_addr, "pending"]), 16)
+    try:
+        gas = int(eth_estimate_gas(rpc, contract, data.hex(), from_addr), 16)
+    except (RevertError, RuntimeError):
+        # state reverts (or RPC refuses): fall back to a calldata-size estimate
+        calldata = data
+        nz = sum(1 for b in calldata if b != 0)
+        gas = 21000 + 16 * nz + 4 * (len(calldata) - nz) + 30000
+    block = rpc_eth(rpc, "eth_getBlockByNumber", ["latest", False]) or {}
+    base_fee = int(block.get("baseFeePerGas", "0x0"), 16)
+    priority = 2 * 10**9  # 2 gwei default tip
+    max_fee = 2 * base_fee + priority
+    return {
+        "type": "0x2",
+        "chainId": "0x1",
+        "nonce": hex(nonce),
+        "to": contract,
+        "value": "0x0",
+        "data": "0x" + data.hex(),
+        "maxPriorityFeePerGas": hex(priority),
+        "maxFeePerGas": hex(max_fee),
+        "gas": hex(gas),
+        "from": from_addr,
+    }
+
+
+def cmd_claim(args, config):
+    if args.list_paths:
+        for k, p in sorted(CLAIM_PATHS.items()):
+            print(f"{k}: {p['name']}\n    contract: {p['contract']}\n    method:   {p['method']}\n    {p['note']}\n")
+        return 0
+    if not args.protocol or not args.address:
+        print("claim requires --protocol and --address (or --list-paths)")
+        return 1
+    path = CLAIM_PATHS.get(args.protocol)
+    if not path:
+        print(f"unknown protocol '{args.protocol}'. Known: {', '.join(sorted(CLAIM_PATHS))}")
+        return 1
+    user = args.address.lower()
+    amount_wei = resolve_amount(config, path, user, args.amount)
+    if amount_wei is None:
+        print(f"'{args.protocol}' needs --amount (no auto-resolution path registered)")
+        return 1
+    if amount_wei <= 0:
+        print("amount is 0; nothing to claim")
+        return 0
+    print(f"claim path: {path['name']}")
+    print(f"  contract: {path['contract']}")
+    print(f"  method:   {path['method']}")
+    print(f"  amount:   {amount_wei} wei ({amount_wei / 1e18:.6f} ETH)")
+    print("  simulating eth_call...")
+    method = path["method"]
+    argtypes = [t.strip() for t in method[method.index("(") + 1:method.index(")")].split(",") if t.strip()]
+    data = selector(method) + encode_args(argtypes, [amount_wei])
+    try:
+        eth_call(config.get("rpc"), path["contract"], data.hex(), from_addr=user)
+        print("  eth_call OK (no revert)")
+    except RuntimeError as e:
+        print(f"  WARNING: {e}")
+        print("  still generating the unsigned tx; verify contract state manually")
+    tx = make_unsigned_tx(config, path, user, amount_wei)
+    print()
+    print("unsigned EIP-1559 transaction (sign offline; never expose your private key):")
+    print(json.dumps(tx, indent=2))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Claim Radar — check Ethereum addresses against the ForgottenETH public recovery index."
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    c = sub.add_parser("check", help="check one or more addresses")
+    c = sub.add_parser("check", help="check addresses against the recovery index")
     c.add_argument("addresses", nargs="+")
     c.add_argument("--detail", action="store_true", help="include per-protocol balance detail")
     c.add_argument("--json", action="store_true", help="output JSON")
@@ -350,6 +612,13 @@ def main():
     w.add_argument("--state", default=DEFAULT_STATE)
     w.add_argument("--notify-cmd", default="", help="shell command template; {message} and {ts} are substituted")
     w.add_argument("--quiet", action="store_true", help="only log, don't print alerts")
+
+    cl = sub.add_parser("claim", help="simulate + generate an unsigned claim transaction")
+    cl.add_argument("--protocol", help="protocol key from CLAIM_PATHS (see --list-paths)")
+    cl.add_argument("--address", help="your wallet address (the claimant)")
+    cl.add_argument("--amount", type=float, default=None, help="claim amount in ETH (auto-resolved if omitted)")
+    cl.add_argument("--config", default=DEFAULT_CONFIG)
+    cl.add_argument("--list-paths", action="store_true", help="list registered claim paths and exit")
 
     args = ap.parse_args()
 
@@ -402,6 +671,9 @@ def main():
             if not args.interval:
                 break
             time.sleep(args.interval)
+    elif args.cmd == "claim":
+        config = load_json(args.config, default_config())
+        sys.exit(cmd_claim(args, config))
 
 
 if __name__ == "__main__":

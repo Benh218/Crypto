@@ -79,6 +79,36 @@ python claim_radar.py watch --funding --quiet
 State (baseline balances, last index commit) is persisted to `~/.claim_radar/state.json`, and all
 alerts are appended to `~/.claim_radar/alerts.log`. The notifier reads public data only.
 
+## Claim Radar Executor (Phase 3)
+
+The `claim` command simulates and generates an **unsigned** EIP-1559 transaction for a verified
+recovery path. It reads public data (ABIs from Blockscout, live state via public RPCs) and never
+touches your private keys — you sign offline in your wallet.
+
+```bash
+# List registered claim paths
+python claim_radar.py claim --list-paths
+
+# Aave v1: auto-resolves your aETH balance via balanceOf(), simulates redeem()
+python claim_radar.py claim --protocol aave_v1 --address 0x5d843c34ff45d866a84d6913cdabd5845ba7c357
+
+# EtherDelta v2: supply the amount from your mapped deposit
+python claim_radar.py claim --protocol etherdelta \
+  --address 0x00317cd2da2044840b1ebe775c676530a7c65ba3 --amount 22
+```
+
+For each path it: resolves the amount, does an `eth_call` simulation (surfacing revert reasons such
+as `execution reverted: Transfer cannot be allowed.`), pulls your live nonce, estimates gas, and
+prints an unsigned type-0x2 transaction JSON. Sign that JSON offline in a wallet like MetaMask or
+Frame, then broadcast via any public node.
+
+Registered paths (contracts + method selectors verified against on-chain ABIs):
+
+| Protocol | Contract | Method | Notes |
+|---|---|---|---|
+| Aave v1 | `0x3a3A65aAb0dd2A17E3F1947bA16138cd37d08c04` | `redeem(uint256)` | Burn aETH shares for ETH |
+| EtherDelta v2 | `0x8d12A197cB00D4747a1fe03395095ce2A5CC6819` | `withdraw(uint256)` | Withdraw ETH deposit balance |
+
 ## Quick Start
 
 ```bash
