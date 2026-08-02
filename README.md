@@ -11,7 +11,32 @@ btc_tools/
 ├── fetcher.py     — Fetcher with Blockchair / Blockchain.info / Bitcoin Core RPC backends
 ├── scanner.py     — Dormant coin scanner (known addresses + custom address lists + CSV export)
 └── cli.py         — CLI: address lookup, UTXO summary, dormant scan, known list
+claim_radar.py     — Claim Radar: check addresses against the ForgottenETH recovery index
 ```
+
+## Claim Radar (claim_radar.py)
+
+Checks Ethereum addresses against the public [ForgottenETH](https://github.com/q84c6tsm95-create/forgotten-eth)
+recovery index (defunct contracts with user-claimable balances — The DAO, Aave v1, EtherDelta, DigixDAO, etc.).
+This is an audit/monitoring tool: it reads public data only, never touches private keys.
+
+```bash
+# 1. Point it at ForgottenETH's data (clone the repo once):
+git clone --depth 1 https://github.com/q84c6tsm95-create/forgotten-eth.git
+export CLAIM_RADAR_DATA=/path/to/forgotten-eth/data
+
+# 2. Check one or more addresses
+python claim_radar.py check 0xbf2c8b606974e36567b4a6ddf548b70cb622442d --detail
+
+# JSON output
+python claim_radar.py check 0x5256d6d94ed14667fa1661a99f5b142b1e051b8e --json
+
+# Largest total mapped balances across the whole index
+python claim_radar.py top -n 10 --min 50
+```
+
+Handles every shard value shape (ETH floats, decimal strings, token/NFT holder dicts), checksummed or raw
+addresses, and leading-zero addresses. Uses the standard library only (no pip installs).
 
 ## Quick Start
 
