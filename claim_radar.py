@@ -522,6 +522,41 @@ def path_data(method, args):
     return selector(method) + encode_args(argtypes, args)
 
 
+def build_unsigned(config, to, method, args, from_addr, value_wei=0, nonce=None):
+    data = path_data(method, args)
+    rpc = config.get("rpc")
+    if nonce is None:
+        nonce = int(rpc_eth(rpc, "eth_getTransactionCount", [from_addr, "pending"]), 16)
+    try:
+        gas = int(eth_estimate_gas(rpc, to, data.hex(), from_addr), 16)
+    except (RevertError, RuntimeError):
+        nz = sum(1 for b in data if b != 0)
+        gas = 21000 + 16 * nz + 4 * (len(data) - nz) + 30000
+    block = rpc_eth(rpc, "eth_getBlockByNumber", ["latest", False]) or {}
+    base_fee = int(block.get("baseFeePerGas", "0x0"), 16)
+    priority = 2 * 10**9  # 2 gwei default tip
+    max_fee = 2 * base_fee + priority
+    return {
+        "type": "0x2",
+        "chainId": "0x1",
+        "nonce": hex(nonce),
+        "to": to,
+        "value": hex(value_wei),
+        "data": "0x" + data.hex(),
+        "maxPriorityFeePerGas": hex(priority),
+        "maxFeePerGas": hex(max_fee),
+        "gas": hex(gas),
+        "from": from_addr,
+    }
+
+
+def make_unsigned_tx(config, path, user, amount_wei):
+    contract = path["contract"]
+    method = path["method"]
+    fixed = [a for a in path.get("fixed_args", [])]
+    return build_unsigned(config, contract, method, fixed + [amount_wei], user)
+
+
 def resolve_amount(config, path, user, amount_eth):
     if amount_eth is not None:
         return int(amount_eth * 1e18)
@@ -532,39 +567,6 @@ def resolve_amount(config, path, user, amount_eth):
     data = path_data(af["method"], args)
     res = eth_call(config.get("rpc"), af["contract"], data.hex())
     return int(res, 16)
-
-
-def make_unsigned_tx(config, path, user, amount_wei):
-    contract = path["contract"]
-    method = path["method"]
-    fixed = [a for a in path.get("fixed_args", [])]
-    data = path_data(method, fixed + [amount_wei])
-    from_addr = user.lower()
-    rpc = config.get("rpc")
-    nonce = int(rpc_eth(rpc, "eth_getTransactionCount", [from_addr, "pending"]), 16)
-    try:
-        gas = int(eth_estimate_gas(rpc, contract, data.hex(), from_addr), 16)
-    except (RevertError, RuntimeError):
-        # state reverts (or RPC refuses): fall back to a calldata-size estimate
-        calldata = data
-        nz = sum(1 for b in calldata if b != 0)
-        gas = 21000 + 16 * nz + 4 * (len(calldata) - nz) + 30000
-    block = rpc_eth(rpc, "eth_getBlockByNumber", ["latest", False]) or {}
-    base_fee = int(block.get("baseFeePerGas", "0x0"), 16)
-    priority = 2 * 10**9  # 2 gwei default tip
-    max_fee = 2 * base_fee + priority
-    return {
-        "type": "0x2",
-        "chainId": "0x1",
-        "nonce": hex(nonce),
-        "to": contract,
-        "value": "0x0",
-        "data": "0x" + data.hex(),
-        "maxPriorityFeePerGas": hex(priority),
-        "maxFeePerGas": hex(max_fee),
-        "gas": hex(gas),
-        "from": from_addr,
-    }
 
 
 def cmd_claim(args, config):
@@ -810,6 +812,99 @@ def cmd_sweep(args, config):
     return 1
 
 
+MIGRATE_PATHS = {
+    "sai": {
+        "name": "SAI (old single-collateral DAI) -> DAI 1:1",
+        "token": "0x89d24a6b4ccb1b6faa2625fe562bdd9a23260359",
+        "decimals": 18,
+        "swap_contract": "0xc73e0383f3aff3215e6f04b0331d58cecf0ab849",
+        "swap_method": "swapSaiToDai(uint256)",
+        "note": "approve ScdMcdMigration on SAI, then swapSaiToDai(amount).",
+    },
+    "ant_v1": {
+        "name": "ANTv1 -> ANTv2 (no deadline)",
+        "token": "0x960b236A07cf122663c4303350609A66A7B288C0",
+        "decimals": 18,
+        "swap_contract": "0x078BEbC744B819657e1927bF41aB8C74cBBF912D",
+        "swap_method": "migrate(uint256)",
+        "note": "approve ANTv2Migrator on ANTv1, then migrate(amount).",
+    },
+}
+
+
+def migrate_check(config, path, user, want_tx=False):
+    token = path["token"]
+    data = path_data("balanceOf(address)", [user])
+    res = eth_call(config.get("rpc"), token, data.hex(), from_addr=user)
+    wei = int(res, 16)
+    out = {"path": path.get("swap_method", "").split("(")[0].replace("swap", "migrate"), "wei": wei}
+    if want_tx and wei > 0:
+        approve_tx = build_unsigned(config, token, "approve(address,uint256)",
+                                    [path["swap_contract"], wei], user)
+        swap_tx = build_unsigned(config, path["swap_contract"], path["swap_method"],
+                                 [wei], user, nonce=int(approve_tx["nonce"], 16) + 1)
+        out["approve_tx"] = approve_tx
+        out["swap_tx"] = swap_tx
+    return out
+
+
+def cmd_migrate(args, config):
+    if args.list:
+        print(f"{'path':<12} {'token':<44} {'swap contract':<44} method")
+        for k, p in sorted(MIGRATE_PATHS.items()):
+            print(f"{k:<12} {p['token']:<44} {p['swap_contract']:<44} {p['swap_method']}")
+            print(f"    {p['name']}")
+            print(f"    {p['note']}")
+        return 0
+    if args.address:
+        user = args.address.lower()
+        for k, p in sorted(MIGRATE_PATHS.items()):
+            try:
+                r = migrate_check(config, p, user, want_tx=args.tx)
+            except (RevertError, RuntimeError) as e:
+                print(f"{k}: read failed ({e})")
+                continue
+            amt = r["wei"] / 10 ** p["decimals"]
+            print(f"{k}: {amt:.6f} unmigrated  ({p['name']})")
+            if amt > 0 and args.tx:
+                print("  step 1 approve:")
+                print(json.dumps(r["approve_tx"], indent=2))
+                print("  step 2 swap/migrate:")
+                print(json.dumps(r["swap_tx"], indent=2))
+            elif amt == 0 and args.tx:
+                print("  (nothing to migrate — no txs generated)")
+        return 0
+    if args.top:
+        ranked = top_addresses(n=args.top, min_balance=args.min)
+
+        def scan_one(addr):
+            hits = []
+            for k, p in sorted(MIGRATE_PATHS.items()):
+                try:
+                    r = migrate_check(config, p, addr)
+                except (RevertError, RuntimeError):
+                    continue
+                amt = r["wei"] / 10 ** p["decimals"]
+                if amt > 0:
+                    hits.append(f"{k}={amt:.4f}")
+            return addr, hits
+
+        rows = []
+        done = 0
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for addr, hits in ex.map(scan_one, [a for a, _ in ranked]):
+                done += 1
+                if hits and addr != "0x" + "0" * 40:
+                    rows.append((addr, hits))
+                if done % 100 == 0:
+                    print(f"  scanned {done}/{len(ranked)}", file=sys.stderr)
+        print(f"{'address':<42}  unmigrated tokens")
+        for addr, hits in rows:
+            print(f"{addr:<42}  {'; '.join(hits)}")
+        return 0
+    return 1
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Claim Radar — check Ethereum addresses against the ForgottenETH public recovery index."
@@ -859,6 +954,14 @@ def main():
     dr.add_argument("--inactive-years", type=float, default=3.0, help="min years since last tx")
     dr.add_argument("--sweep", action="store_true", help="also check each dormant hit against sweep contracts")
     dr.add_argument("--config", default=DEFAULT_CONFIG)
+
+    mi = sub.add_parser("migrate", help="find unmigrated token balances (SAI->DAI, ANTv1->ANTv2)")
+    mi.add_argument("--list", action="store_true", help="list registered migration paths and exit")
+    mi.add_argument("--address", help="check a single address for unmigrated balances")
+    mi.add_argument("--tx", action="store_true", help="also generate unsigned approve + swap txs")
+    mi.add_argument("--top", type=int, default=0, help="scan the top-N addresses by mapped balance")
+    mi.add_argument("--min", type=float, default=0.0, help="min mapped balance to include in scan")
+    mi.add_argument("--config", default=DEFAULT_CONFIG)
 
     args = ap.parse_args()
 
@@ -920,6 +1023,9 @@ def main():
     elif args.cmd == "dormant":
         config = load_json(args.config, default_config())
         sys.exit(cmd_dormant(args, config))
+    elif args.cmd == "migrate":
+        config = load_json(args.config, default_config())
+        sys.exit(cmd_migrate(args, config))
 
 
 if __name__ == "__main__":

@@ -157,6 +157,35 @@ python claim_radar.py dormant --addr-file ./watchlist.txt --min-eth 1 --inactive
 "Value" is the larger of the address's current ETH balance and its mapped index balance, so money
 parked in defunct contracts counts even when the wallet itself holds no ETH.
 
+## Claim Radar Migration Pools (Phase 4c)
+
+The `migrate` command finds legacy-token balances that are still redeemable 1:1 through official
+migration contracts — money that is *accessible* but was never moved. Each path is a two-step flow:
+`approve` the migration contract on the legacy token, then call its swap/migrate function. With
+`--tx`, the tool emits both unsigned transactions (swap tx pre-set to nonce+1).
+
+```bash
+# List registered migration paths
+python claim_radar.py migrate --list
+
+# Check one address for unmigrated SAI / ANTv1, generate unsigned approve + swap txs
+python claim_radar.py migrate --address 0x5256d6d94ed14667fa1661a99f5b142b1e051b8e --tx
+
+# Scan the top-N mapped addresses for unmigrated balances
+python claim_radar.py migrate --top 200 --min 1
+```
+
+Verified migration paths:
+
+| path | legacy token | migration contract | call |
+|------|--------------|--------------------|------|
+| `sai` | SAI `0x89d24a…2359` | ScdMcdMigration `0xc73e03…ab849` | `swapSaiToDai(uint256)` |
+| `ant_v1` | ANTv1 `0x960b23…88C0` | ANTv2Migrator `0x078BEb…F912D` | `migrate(uint256)` |
+
+Notes: the SAI→DAI swap is still 1:1 on the original `ScdMcdMigration` contract even though the old
+web portal is gone; the ANTv1→ANTv2 upgrade officially has **no deadline**. A top-200 scan surfaced
+e.g. 10,999 ANTv1 (`0x893608…7cb8`) and 25,000 ANTv1 (`0x41f89c…5f92c`) still unmigrated.
+
 ## Quick Start
 
 ```bash
