@@ -163,26 +163,49 @@ INDEX_CHANGELOG_URL = "https://raw.githubusercontent.com/q84c6tsm95-create/forgo
 CONFIG_DIR = os.path.expanduser("~/.claim_radar")
 DEFAULT_CONFIG = os.path.join(CONFIG_DIR, "watch_config.json")
 DEFAULT_STATE = os.path.join(CONFIG_DIR, "state.json")
-ALERT_LOG = os.path.join(CONFIG_DIR, "alerts.log")
 
+USAGE_GUIDE = """Claim Radar — plain-English usage guide
+========================================
 
-def http_json(url, data=None, headers=None, timeout=20):
-    req = urllib.request.Request(url, data=json.dumps(data).encode() if data is not None else None)
-    req.add_header("Accept", "application/json")
-    req.add_header("User-Agent", "claim-radar/0.2 (+https://github.com/Benh218/Crypto)")
-    if data is not None:
-        req.add_header("Content-Type", "application/json")
-    for k, v in (headers or {}).items():
-        req.add_header(k, v)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+Claim Radar finds crypto stuck in broken/abandoned/shut-down Ethereum projects
+(2016-2018). It reads the public ForgottenETH index and the live blockchain. It
+NEVER touches private keys; every transaction it outputs is unsigned — you sign
+it in your own wallet.
 
+Commands (run: python claimradar.py <command> --help):
+  check <addr>    search the index for your address -> amount per project, or
+                  "no mapped balances found"
+  top -n 10       biggest stuck balances overall (--min 1 ignores < 1 ETH)
+  watch           background alarm on funding + index updates; --init writes a
+                  default config; run every 10 min via cron
+  sweep           LIVE read of dead contracts (Aave v1 aETH, EtherDelta, IDEX v1)
+                  --top 300 scans the biggest addresses; --address checks one
+  dormant         find high-value long-inactive addresses (dead-man's switch)
+                  --top 100 --min-eth 100 --inactive-years 3 --sweep
+  migrate         find unmigrated SAI/ANTv1 (still swappable 1:1)
+                  --top 300 --min 1, or --address X --tx for both unsigned txs
+  claim           build a simulated, unsigned recovery tx
+                  claim --protocol etherdelta --address 0x... ; --list-paths
+                  shows all supported recovery methods
 
-def wei_to_eth(hex_wei):
-    try:
-        return int(hex_wei, 16) / 1e18
-    except (TypeError, ValueError):
-        return 0.0
+Quick start:
+  1. python claimradar.py check 0xYourAddress --detail   # do you have anything?
+  2. python claimradar.py top -n 20                      # what's worth looking at
+  3. python claimradar.py sweep --top 300 --min 1        # claimable right now
+  4. python claimradar.py claim --protocol <name> --address 0x...  # build tx
+  5. Sign the JSON in your wallet and broadcast.
+  Optional: python claimradar.py watch --init && cron every 10 min.
+
+Safety:
+  - Reads public data only; never stores private keys.
+  - "Mapped" balances are from a public research index — confirm with a live
+    sweep/claim simulation before trusting a number.
+  - Claimable != free money: recovery still needs the right contract call + gas.
+  - Nothing here grants access to anyone else's funds; it only surfaces which
+    addresses hold stuck value.
+
+Full docs: USAGE.md in the repo.
+"""
 
 
 def default_config():
@@ -962,6 +985,12 @@ def main():
     mi.add_argument("--top", type=int, default=0, help="scan the top-N addresses by mapped balance")
     mi.add_argument("--min", type=float, default=0.0, help="min mapped balance to include in scan")
     mi.add_argument("--config", default=DEFAULT_CONFIG)
+
+    ap.add_argument("--guide", action="store_true", help="print the plain-English usage guide and exit")
+
+    if "--guide" in sys.argv:
+        print(USAGE_GUIDE)
+        return
 
     args = ap.parse_args()
 

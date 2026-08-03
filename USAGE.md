@@ -24,7 +24,8 @@ Needs only **Python 3 stdlib** — no package installs.
 ```bash
 git clone https://github.com/Benh218/Crypto.git
 cd Crypto
-python claim_radar.py --help
+python claim_radar.py --help      # all commands
+python claim_radar.py --guide     # this guide, built into the tool
 ```
 
 Optional: point it at the downloaded ForgottenETH index for `--detail` lookups.
