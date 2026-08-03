@@ -136,6 +136,27 @@ Each hit prints the claim command to run against the same contract. Verified swe
 | EtherDelta v2 | `0x8d12A197cB00D4747a1fe03395095ce2A5CC6819` | `balanceOf(address,address)` | ETH |
 | IDEX v1 | `0x2a0c0DBEcC7E4D658f48E01e3fA353F44050c208` | `balanceOf(address,address)` | ETH |
 
+## Claim Radar Dead-Man's Switch (Phase 4b)
+
+The `dormant` command finds high-value addresses that have been inactive for years — classic
+recovery targets — using the Blockscout explorer API for last-activity and public RPCs for balances.
+Optional `--sweep` cross-references each hit against the sweep contracts to surface value still
+sitting in defunct protocols.
+
+```bash
+# Single address check
+python claim_radar.py dormant --address 0x6d2af065ccb60c0f7e8ec5907c961c42a3447127 --sweep
+
+# Scan the top-N mapped addresses for dormant whales (value >= 100 ETH, inactive >= 3y)
+python claim_radar.py dormant --top 100 --min-eth 100 --inactive-years 3 --sweep
+
+# Custom watchlist (newline-separated addresses)
+python claim_radar.py dormant --addr-file ./watchlist.txt --min-eth 1 --inactive-years 2
+```
+
+"Value" is the larger of the address's current ETH balance and its mapped index balance, so money
+parked in defunct contracts counts even when the wallet itself holds no ETH.
+
 ## Quick Start
 
 ```bash

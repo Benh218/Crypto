@@ -606,6 +606,97 @@ def cmd_claim(args, config):
     return 0
 
 
+BLOCKSCOUT = "https://eth.blockscout.com"
+
+
+def last_activity(address):
+    url = f"{BLOCKSCOUT}/api/v2/addresses/{address}/transactions?items_count=1"
+    data = http_json(url, headers={"User-Agent": "claim-radar/0.4"})
+    items = data.get("items") or []
+    if not items:
+        return None
+    ts = items[0].get("timestamp")
+    if not ts:
+        return None
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def mapped_for(address):
+    addr = address.lower()
+    total = 0.0
+    for shard_file in sorted(os.listdir(SHARDS_DIR)):
+        if not shard_file.endswith(".json"):
+            continue
+        with open(os.path.join(SHARDS_DIR, shard_file)) as f:
+            shard = json.load(f)
+        entry = shard.get(addr)
+        if entry:
+            total += sum(extract_balance(v) for v in entry.values())
+    return total
+
+
+def cmd_dormant(args, config):
+    population = []
+    if args.address:
+        population = [(args.address, mapped_for(args.address))]
+    elif args.top:
+        population = top_addresses(n=args.top, min_balance=0.0)
+    elif args.addr_file:
+        with open(args.addr_file) as f:
+            population = [(ln.strip(), 0.0) for ln in f if ln.strip() and not ln.startswith("#")]
+    if not population:
+        print("dormant needs --address, --top N, or --addr-file")
+        return 1
+
+    cutoff = args.inactive_years * 365.25 * 86400
+
+    def check(item):
+        addr, mapped = item
+        bal = rpc_balance(config, addr) or 0.0
+        value = max(bal, mapped)
+        if value < args.min_eth:
+            return None
+        last = last_activity(addr)
+        if last is None:
+            age_days = None
+        else:
+            age_sec = (datetime.now(timezone.utc) - last).total_seconds()
+            age_days = age_sec / 86400
+            if age_sec < cutoff:
+                return None
+        hits = {}
+        if args.sweep:
+            for k, p in sorted(SWEEP_PATHS.items()):
+                try:
+                    wei = sweep_check_one(config, p, addr)
+                except (RevertError, RuntimeError):
+                    continue
+                eth = wei / 1e18
+                if eth > 0:
+                    hits[k] = eth
+        return (value, addr, age_days, last, hits)
+
+    rows = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for res in ex.map(check, population):
+            done += 1
+            if res:
+                rows.append(res)
+            if done % 100 == 0:
+                print(f"  checked {done}/{len(population)}", file=sys.stderr)
+    rows.sort(key=lambda r: -r[0])
+    if not rows:
+        print("no dormant addresses with matching balances found")
+        return 0
+    print(f"{'value ETH':>10}  {'address':<42}  last-activity{'':<8}  sweep hits")
+    for value, addr, age_days, last, hits in rows:
+        when = "never" if last is None else last.strftime("%Y-%m-%d")
+        sweep_str = "; ".join(f"{k}={v:.3f}ETH" for k, v in hits.items()) if hits else "-"
+        print(f"{value:>10.4f}  {addr:<42}  {when:<24}  {sweep_str}")
+    return 0
+
+
 SWEEP_PATHS = {
     "aave_v1": {
         "name": "Aave v1 (aETH redeemable)",
@@ -760,6 +851,15 @@ def main():
     sw.add_argument("--detail", action="store_true", help="show zero balances too")
     sw.add_argument("--config", default=DEFAULT_CONFIG)
 
+    dr = sub.add_parser("dormant", help="find dormant high-balance addresses (dead-man's switch)")
+    dr.add_argument("--address", help="check a single address")
+    dr.add_argument("--top", type=int, default=0, help="scan the top-N addresses by mapped balance")
+    dr.add_argument("--addr-file", help="scan addresses from a newline-separated file")
+    dr.add_argument("--min-eth", type=float, default=1.0, help="min current ETH balance to report")
+    dr.add_argument("--inactive-years", type=float, default=3.0, help="min years since last tx")
+    dr.add_argument("--sweep", action="store_true", help="also check each dormant hit against sweep contracts")
+    dr.add_argument("--config", default=DEFAULT_CONFIG)
+
     args = ap.parse_args()
 
     if args.cmd == "check":
@@ -817,6 +917,9 @@ def main():
     elif args.cmd == "sweep":
         config = load_json(args.config, default_config())
         sys.exit(cmd_sweep(args, config))
+    elif args.cmd == "dormant":
+        config = load_json(args.config, default_config())
+        sys.exit(cmd_dormant(args, config))
 
 
 if __name__ == "__main__":
