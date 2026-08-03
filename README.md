@@ -108,6 +108,33 @@ Registered paths (contracts + method selectors verified against on-chain ABIs):
 |---|---|---|---|
 | Aave v1 | `0x3a3A65aAb0dd2A17E3F1947bA16138cd37d08c04` | `redeem(uint256)` | Burn aETH shares for ETH |
 | EtherDelta v2 | `0x8d12A197cB00D4747a1fe03395095ce2A5CC6819` | `withdraw(uint256)` | Withdraw ETH deposit balance |
+| IDEX v1 | `0x2a0c0DBEcC7E4D658f48E01e3fA353F44050c208` | `withdraw(address,uint256)` | Withdraw ETH deposit balance |
+
+## Claim Radar Sweeper (Phase 4a)
+
+The `sweep` command does **live on-chain reads** (not the static index) against a registry of
+recovery contracts to find currently-claimable balances. It caches reads for 6h in
+`~/.claim_radar/sweep_cache.json`.
+
+```bash
+# List registered sweep contracts (read function used per contract)
+python claim_radar.py sweep --list
+
+# Check one address against every sweep contract (live balanceOf calls)
+python claim_radar.py sweep --address 0xa7267b534bada4f7a77251ab54e6a78444786c7c
+
+# Cross-reference: scan the top-N addresses by mapped index balance and rank
+# by live claimable amount (cron-friendly, resumes fast via cache)
+python claim_radar.py sweep --top 300 --min 1
+```
+
+Each hit prints the claim command to run against the same contract. Verified sweep paths:
+
+| Protocol | Contract | Read | Unit |
+|---|---|---|---|
+| Aave v1 | `0x3a3A65aAb0dd2A17E3F1947bA16138cd37d08c04` | `balanceOf(address)` | aETH |
+| EtherDelta v2 | `0x8d12A197cB00D4747a1fe03395095ce2A5CC6819` | `balanceOf(address,address)` | ETH |
+| IDEX v1 | `0x2a0c0DBEcC7E4D658f48E01e3fA353F44050c208` | `balanceOf(address,address)` | ETH |
 
 ## Quick Start
 

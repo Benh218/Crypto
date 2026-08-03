@@ -4,15 +4,11 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
-
-try:
-    from datetime import datetime, timezone
-except ImportError:  # pragma: no cover
-    from datetime import datetime, timezone as _tz
-
-    timezone = _tz
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 DATA_DIR = os.environ.get(
     "CLAIM_RADAR_DATA",
@@ -148,6 +144,8 @@ def top_addresses(n=10, min_balance=1.0):
         with open(os.path.join(SHARDS_DIR, shard_file)) as f:
             shard = json.load(f)
         for addr, protos in shard.items():
+            if not addr.startswith("0x"):
+                continue
             total = sum(extract_balance(v) for v in protos.values())
             if total >= min_balance:
                 totals[addr] = totals.get(addr, 0) + total
@@ -434,7 +432,24 @@ CLAIM_PATHS = {
         "name": "EtherDelta v2 (ETH withdraw)",
         "contract": "0x8d12A197cB00D4747a1fe03395095ce2A5CC6819",
         "method": "withdraw(uint256)",
-        "note": "Withdraw ETH deposit balance. Supply --amount (your mapped deposit).",
+        "amount_from": {
+            "method": "balanceOf(address,address)",
+            "contract": "0x8d12A197cB00D4747a1fe03395095ce2A5CC6819",
+            "args": ["0x0000000000000000000000000000000000000000", "<address>"],
+        },
+        "note": "Withdraw ETH deposit balance from the defunct EtherDelta v2 contract.",
+    },
+    "idex_v1": {
+        "name": "IDEX v1 (ETH withdraw)",
+        "contract": "0x2a0c0DBEcC7E4D658f48E01e3fA353F44050c208",
+        "method": "withdraw(address,uint256)",
+        "fixed_args": ["0x0000000000000000000000000000000000000000"],
+        "amount_from": {
+            "method": "balanceOf(address,address)",
+            "contract": "0x2a0c0DBEcC7E4D658f48E01e3fA353F44050c208",
+            "args": ["0x0000000000000000000000000000000000000000", "<address>"],
+        },
+        "note": "Withdraw ETH deposit balance from the defunct IDEX v1 Exchange contract.",
     },
 }
 
@@ -502,13 +517,19 @@ def eth_estimate_gas(rpc, to, data, from_addr):
     return rpc_eth(rpc, "eth_estimateGas", [{"to": to, "data": _hex(data), "from": from_addr}])
 
 
+def path_data(method, args):
+    argtypes = [t.strip() for t in method[method.index("(") + 1:method.index(")")].split(",") if t.strip()]
+    return selector(method) + encode_args(argtypes, args)
+
+
 def resolve_amount(config, path, user, amount_eth):
     if amount_eth is not None:
         return int(amount_eth * 1e18)
     af = path.get("amount_from")
     if not af:
         return None
-    data = selector(af["method"]) + encode_args(["address"], [user])
+    args = [user if a == "<address>" else a for a in af.get("args", ["<address>"])]
+    data = path_data(af["method"], args)
     res = eth_call(config.get("rpc"), af["contract"], data.hex())
     return int(res, 16)
 
@@ -516,8 +537,8 @@ def resolve_amount(config, path, user, amount_eth):
 def make_unsigned_tx(config, path, user, amount_wei):
     contract = path["contract"]
     method = path["method"]
-    argtypes = [t.strip() for t in method[method.index("(") + 1:method.index(")")].split(",") if t.strip()]
-    data = selector(method) + encode_args(argtypes, [amount_wei])
+    fixed = [a for a in path.get("fixed_args", [])]
+    data = path_data(method, fixed + [amount_wei])
     from_addr = user.lower()
     rpc = config.get("rpc")
     nonce = int(rpc_eth(rpc, "eth_getTransactionCount", [from_addr, "pending"]), 16)
@@ -571,9 +592,7 @@ def cmd_claim(args, config):
     print(f"  method:   {path['method']}")
     print(f"  amount:   {amount_wei} wei ({amount_wei / 1e18:.6f} ETH)")
     print("  simulating eth_call...")
-    method = path["method"]
-    argtypes = [t.strip() for t in method[method.index("(") + 1:method.index(")")].split(",") if t.strip()]
-    data = selector(method) + encode_args(argtypes, [amount_wei])
+    data = path_data(path["method"], [a for a in path.get("fixed_args", [])] + [amount_wei])
     try:
         eth_call(config.get("rpc"), path["contract"], data.hex(), from_addr=user)
         print("  eth_call OK (no revert)")
@@ -585,6 +604,119 @@ def cmd_claim(args, config):
     print("unsigned EIP-1559 transaction (sign offline; never expose your private key):")
     print(json.dumps(tx, indent=2))
     return 0
+
+
+SWEEP_PATHS = {
+    "aave_v1": {
+        "name": "Aave v1 (aETH redeemable)",
+        "contract": "0x3a3A65aAb0dd2A17E3F1947bA16138cd37d08c04",
+        "read": "balanceOf(address)",
+        "read_args": ["<address>"],
+        "unit": "aETH",
+        "claim": "aave_v1",
+    },
+    "etherdelta": {
+        "name": "EtherDelta v2 (ETH balance)",
+        "contract": "0x8d12A197cB00D4747a1fe03395095ce2A5CC6819",
+        "read": "balanceOf(address,address)",
+        "read_args": ["0x0000000000000000000000000000000000000000", "<address>"],
+        "unit": "ETH",
+        "claim": "etherdelta",
+    },
+    "idex_v1": {
+        "name": "IDEX v1 (ETH balance)",
+        "contract": "0x2a0c0DBEcC7E4D658f48E01e3fA353F44050c208",
+        "read": "balanceOf(address,address)",
+        "read_args": ["0x0000000000000000000000000000000000000000", "<address>"],
+        "unit": "ETH",
+        "claim": "idex_v1",
+    },
+}
+
+SWEEP_CACHE = os.path.join(CONFIG_DIR, "sweep_cache.json")
+SWEEP_TTL = 6 * 3600
+SWEEP_LOCK = threading.Lock()
+
+
+def read_claimable(rpc, path, user):
+    args = [user if a == "<address>" else a for a in path["read_args"]]
+    data = path_data(path["read"], args)
+    res = eth_call(rpc, path["contract"], data.hex(), from_addr=user)
+    return int(res, 16)
+
+
+def sweep_check_one(config, path, user):
+    with SWEEP_LOCK:
+        cache = load_json(SWEEP_CACHE, {})
+        key = f"{user}:{path['claim']}"
+        hit = cache.get(key)
+        now = time.time()
+        if hit and now - hit.get("ts", 0) < SWEEP_TTL:
+            return hit["wei"]
+    wei = read_claimable(config.get("rpc"), path, user)
+    with SWEEP_LOCK:
+        cache = load_json(SWEEP_CACHE, {})
+        cache[key] = {"wei": wei, "ts": now}
+        save_json(SWEEP_CACHE, cache)
+    return wei
+
+
+def cmd_sweep(args, config):
+    if args.list:
+        print(f"{'protocol':<12} {'contract':<44} {'read':<28} unit")
+        for k, p in sorted(SWEEP_PATHS.items()):
+            print(f"{k:<12} {p['contract']:<44} {p['read']:<28} {p['unit']}")
+        return 0
+    if args.address:
+        user = args.address.lower()
+        total_eth = 0.0
+        for k, p in sorted(SWEEP_PATHS.items()):
+            try:
+                wei = sweep_check_one(config, p, user)
+            except (RevertError, RuntimeError) as e:
+                print(f"{k}: read failed ({e})")
+                continue
+            eth = wei / 1e18
+            if p["unit"] == "ETH":
+                total_eth += eth
+            if eth > 0 or args.detail:
+                print(f"{k}: {eth:.6f} {p['unit']}  ({p['name']})")
+                if eth > 0:
+                    print(f"    claim via: claimradar.py claim --protocol {p['claim']} --address {user}")
+        print(f"total claimable ETH (excl. token units): {total_eth:.6f}")
+        return 0
+    if args.top:
+        ranked = top_addresses(n=args.top, min_balance=args.min)
+
+        def scan_one(addr):
+            total = 0.0
+            details = []
+            for k, p in sorted(SWEEP_PATHS.items()):
+                try:
+                    wei = sweep_check_one(config, p, addr)
+                except (RevertError, RuntimeError):
+                    continue
+                eth = wei / 1e18
+                if eth > 0:
+                    total += eth
+                    details.append(f"{k}={eth:.4f}{p['unit']}")
+            return total, addr, details
+
+        rows = []
+        done = 0
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for total, addr, details in ex.map(scan_one, [a for a, _ in ranked]):
+                done += 1
+                if details:
+                    rows.append((total, addr, details))
+                if done % 100 == 0:
+                    print(f"  scanned {done}/{len(ranked)}", file=sys.stderr)
+        rows.sort(reverse=True)
+        print(f"{'claimable ETH':>13}  {'address':<42}  sweep hits")
+        for total, addr, details in rows:
+            print(f"{total:>13.4f}  {addr:<42}  {'; '.join(details)}")
+        return 0
+    return 1
 
 
 def main():
@@ -619,6 +751,14 @@ def main():
     cl.add_argument("--amount", type=float, default=None, help="claim amount in ETH (auto-resolved if omitted)")
     cl.add_argument("--config", default=DEFAULT_CONFIG)
     cl.add_argument("--list-paths", action="store_true", help="list registered claim paths and exit")
+
+    sw = sub.add_parser("sweep", help="live on-chain sweep of claimable balances")
+    sw.add_argument("--list", action="store_true", help="list registered sweep contracts and exit")
+    sw.add_argument("--address", help="check one address against all sweep contracts")
+    sw.add_argument("--top", type=int, default=0, help="scan the top-N addresses by mapped balance")
+    sw.add_argument("--min", type=float, default=0.0, help="min mapped balance to include in scan")
+    sw.add_argument("--detail", action="store_true", help="show zero balances too")
+    sw.add_argument("--config", default=DEFAULT_CONFIG)
 
     args = ap.parse_args()
 
@@ -674,6 +814,9 @@ def main():
     elif args.cmd == "claim":
         config = load_json(args.config, default_config())
         sys.exit(cmd_claim(args, config))
+    elif args.cmd == "sweep":
+        config = load_json(args.config, default_config())
+        sys.exit(cmd_sweep(args, config))
 
 
 if __name__ == "__main__":
