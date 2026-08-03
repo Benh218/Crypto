@@ -16,6 +16,8 @@ your private keys, and every transaction it outputs is unsigned (you sign it you
 | `dormant --top 100` | Find high-value, long-inactive addresses | dormant whales, optionally sweep-cross-referenced |
 | `migrate --top 300` | Find unmigrated SAI / ANTv1 (still swappable 1:1) | addresses + amounts |
 | `claim --protocol X` | Build a simulated, unsigned recovery tx | JSON tx to sign yourself |
+| `registry` | Track donation/declared-recovery addresses & alert on funding | live balances + alerts |
+| `open` | Free-unclaimed/open public claim pools: scan, check, claim | pool balances + unsigned claim tx |
 
 ## Setup
 
@@ -81,6 +83,42 @@ python claim_radar.py watch --index --funding --quiet   # run every 10 min via c
 ```
 
 Runtime state lives in `~/.claim_radar/` (watch config, state, alerts log, sweep cache).
+
+### 6. Track donation / declared-recovery addresses
+
+Some addresses *publicly declare* what happens to funds sent to them (donation vaults, burn
+addresses with a published claim path, successor-designated wallets). Keep those in a registry
+and get alerted when they receive funding:
+
+```bash
+python claim_radar.py registry --add 0x... --label 'Vault' \
+  --source 'https://link-to-terms' --type donation_designated \
+  --eligibility open --claim-method 'claim()'
+
+python claim_radar.py registry            # list what you're tracking
+python claim_radar.py registry --live     # current on-chain balance of each
+python claim_radar.py registry --watch --interval 300   # alert on funding changes
+```
+
+### 7. Free-unclaimed / open public claims
+
+The `open` command is the tracker for public claim pools — each pool is tagged by **who may
+legally claim it** (`open` = anyone, `proof` = needs a proof, `designated` = you must control the
+address). It scans balances, shows terms, and builds an unsigned claim tx **only** for pools
+tagged `open`.
+
+```bash
+python claim_radar.py open                         # scan all pool balances
+python claim_radar.py open --check aave_v1         # terms + eligibility of one pool
+python claim_radar.py open --add mypool --contract 0x... --name '...' \
+  --eligibility open --claim-method 'claim(uint256)' --terms 'https://...'
+python claim_radar.py open --claim-pool mypool --claim-address 0xYourWallet --amount 1.5
+python claim_radar.py open --watch --interval 300  # alert when a pool's balance changes
+```
+
+Honest limit: genuinely "anyone can claim" pools are rare. If a pool is `designated` or `proof`,
+the tool tells you what's required instead of pretending it's claimable — it never generates a
+transaction that would take someone else's funds.
 
 ## Real findings from development scans
 

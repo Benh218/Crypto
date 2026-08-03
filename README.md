@@ -186,6 +186,65 @@ Notes: the SAI→DAI swap is still 1:1 on the original `ScdMcdMigration` contrac
 web portal is gone; the ANTv1→ANTv2 upgrade officially has **no deadline**. A top-200 scan surfaced
 e.g. 10,999 ANTv1 (`0x893608…7cb8`) and 25,000 ANTv1 (`0x41f89c…5f92c`) still unmigrated.
 
+## Claim Radar Registry (Phase 5a)
+
+The `registry` command tracks **donation / declared-recovery addresses** — burn, donation, or
+successor-designated addresses that have *publicly declared* what happens to funds sent to them.
+You keep the list; the tool watches them and alerts when funding lands.
+
+```bash
+# Register a declared address with its public terms
+python claim_radar.py registry --add 0xbb9bc244d798123fde783fcc1c72d3bb8c189413 \
+  --label 'The DAO WithdrawDAO wrapper' --type burn_with_claim \
+  --source 'https://github.com/q84c6tsm95-create/forgotten-eth' \
+  --claim-method 'withdraw()' --eligibility designated
+
+python claim_radar.py registry                       # list tracked declarations
+python claim_radar.py registry --live                # show live ETH balance of each
+python claim_radar.py registry --addr 0x...          # live-check a single declared address
+python claim_radar.py registry --export backup.json  # export the registry
+python claim_radar.py registry --remove 0x...        # stop tracking an address
+
+# Watch mode: poll each declared address, alert on inbound funding (+ETH)
+python claim_radar.py registry --watch --interval 300 --notify-cmd 'curl ... {message}'
+```
+
+`--type` is one of `donation_designated`, `burn_with_claim`, `successor_designated`,
+`open_claim`, `funding_target`. `--eligibility` is `open`, `proof`, `designated`, or `unknown` —
+be honest about who is actually entitled to the funds.
+
+## Claim Radar Open Claims (Phase 5b)
+
+The `open` command is the **"free unclaimed crypto" tracker**: a registry of public claim pools
+(tagged by who may legally claim), a live balance scanner, and an unsigned-claim builder. It only
+builds claim transactions for pools tagged `eligibility=open`; everything else prints the exact
+requirement instead of pretending you can claim it.
+
+```bash
+# Default: live-scan every registered pool's balance
+python claim_radar.py open
+
+# Register a pool you found with published terms
+python claim_radar.py open --add mypool --contract 0x... --name '...' \
+  --eligibility open --claim-method 'claim(uint256)' --terms 'https://...' \
+  --deadline 2026-12-31 --note '...'
+
+python claim_radar.py open --check aave_v1        # terms + eligibility of one pool
+python claim_radar.py open --remove mypool        # stop tracking a pool
+
+# Build an unsigned claim tx for a pool tagged eligibility=open
+python claim_radar.py open --claim-pool mypool --claim-address 0xYourWallet --amount 1.5
+
+# Watch mode: poll pool balances, alert on new funding / changes
+python claim_radar.py open --watch --interval 300 --notify-cmd 'curl ... {message}'
+```
+
+Seed pools are the three real, on-chain-verified recovery mechanisms (Aave v1, EtherDelta v2,
+IDEX v1), honestly tagged `designated` — they require controlling the balance's address. Real
+"anyone may claim" pools are rare and change fast; register them with `open --add` as you find
+them (airdrop trackers, bounty vaults, public redemption contracts). Eligibility is labelled per
+pool, and `open claim` refuses to build a tx unless the pool is genuinely open.
+
 ## Quick Start
 
 New to Claim Radar? Read the plain-English guide first: **[USAGE.md](USAGE.md)**.

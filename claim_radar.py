@@ -137,6 +137,8 @@ def format_results(address, results):
 
 
 def top_addresses(n=10, min_balance=1.0):
+    if not os.path.isdir(SHARDS_DIR):
+        return []
     totals = {}
     for shard_file in sorted(os.listdir(SHARDS_DIR)):
         if not shard_file.endswith(".json"):
@@ -163,6 +165,27 @@ INDEX_CHANGELOG_URL = "https://raw.githubusercontent.com/q84c6tsm95-create/forgo
 CONFIG_DIR = os.path.expanduser("~/.claim_radar")
 DEFAULT_CONFIG = os.path.join(CONFIG_DIR, "watch_config.json")
 DEFAULT_STATE = os.path.join(CONFIG_DIR, "state.json")
+ALERT_LOG = os.path.join(CONFIG_DIR, "alerts.log")
+
+
+def http_json(url, data=None, headers=None, timeout=20):
+    req = urllib.request.Request(url, data=json.dumps(data).encode() if data is not None else None)
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "claim-radar/0.5 (+https://github.com/Benh218/Crypto)")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def wei_to_eth(hex_wei):
+    try:
+        return int(hex_wei, 16) / 1e18
+    except (TypeError, ValueError):
+        return 0.0
+
 
 USAGE_GUIDE = """Claim Radar — plain-English usage guide
 ========================================
@@ -187,6 +210,15 @@ Commands (run: python claimradar.py <command> --help):
   claim           build a simulated, unsigned recovery tx
                   claim --protocol etherdelta --address 0x... ; --list-paths
                   shows all supported recovery methods
+  registry        track donation/declared-recovery addresses (public offers)
+                  registry --add 0x... --label 'vault' --source <url>; --live
+                  shows current balances; watch mode alerts on funding
+  open            free-unclaimed / open public claim pools: scan, check, claim
+                  open (default scan) live-reads each pool's balance;
+                  open check <key> shows terms + eligibility;
+                  open claim --claim-pool <key> --claim-address 0x... builds
+                  an unsigned claim tx for pools tagged eligibility=open;
+                  open add registers a new pool you found with public terms
 
 Quick start:
   1. python claimradar.py check 0xYourAddress --detail   # do you have anything?
@@ -647,6 +679,8 @@ def last_activity(address):
 
 
 def mapped_for(address):
+    if not os.path.isdir(SHARDS_DIR):
+        return 0.0
     addr = address.lower()
     total = 0.0
     for shard_file in sorted(os.listdir(SHARDS_DIR)):
@@ -928,6 +962,443 @@ def cmd_migrate(args, config):
     return 1
 
 
+# ---------------------------------------------------------------------------
+# Phase 5 — Registry: donation / declared-recovery address tracking
+# ---------------------------------------------------------------------------
+
+DEFAULT_REGISTRY = os.path.join(CONFIG_DIR, "registry.json")
+REGISTRY_STATE = os.path.join(CONFIG_DIR, "registry_state.json")
+
+DECLARATION_TYPES = {
+    "donation_designated": "donation/burn address with publicly designated recovery",
+    "burn_with_claim": "burn address that keeps a published claim() path",
+    "successor_designated": "address whose successor/beneficiary is publicly declared",
+    "open_claim": "public contract with a claim function anyone may call",
+    "funding_target": "address watched purely as a funding/entitlement target",
+}
+
+REGISTRY_ELIGIBILITY = ("open", "proof", "designated", "unknown")
+
+
+def load_registry(path):
+    reg = load_json(path, {"entries": []})
+    reg.setdefault("entries", [])
+    return reg
+
+
+def save_registry(path, reg):
+    save_json(path, reg)
+
+
+def registry_key(e):
+    return normalize(e.get("address", ""))
+
+
+def registry_check_path(e):
+    """A live read path for a declared address, if it has one registered."""
+    claim = (e.get("claim_method") or "").strip()
+    if not claim or "(" not in claim:
+        return None
+    return {"contract": e.get("address"), "method": claim}
+
+
+def cmd_registry(args, config):
+    path = args.config or DEFAULT_REGISTRY
+    if args.export:
+        reg = load_registry(path)
+        with open(args.export, "w") as f:
+            json.dump(reg, f, indent=2)
+        print(f"exported {len(reg['entries'])} registry entries to {args.export}")
+        return 0
+    if args.add:
+        addr = normalize(args.add)
+        if len(addr.removeprefix("0x")) != 40:
+            print(f"invalid address: {args.add}")
+            return 1
+        reg = load_registry(path)
+        entry = {
+            "address": addr,
+            "label": args.label or addr,
+            "declaration_type": args.type or "donation_designated",
+            "source": args.source or "",
+            "claim_method": args.claim_method or "",
+            "eligibility": args.eligibility or "unknown",
+            "note": args.note or "",
+            "min_delta_eth": args.min_delta,
+            "added_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if entry["declaration_type"] not in DECLARATION_TYPES:
+            print(f"unknown declaration type '{entry['declaration_type']}'. Known: {', '.join(sorted(DECLARATION_TYPES))}")
+            return 1
+        if entry["eligibility"] not in REGISTRY_ELIGIBILITY:
+            print(f"unknown eligibility '{entry['eligibility']}'. Known: {', '.join(REGISTRY_ELIGIBILITY)}")
+            return 1
+        reg["entries"] = [e for e in reg["entries"] if registry_key(e) != addr]
+        reg["entries"].append(entry)
+        save_registry(path, reg)
+        print(f"added {addr} to registry ({entry['label']})")
+        return 0
+    if args.remove:
+        addr = normalize(args.remove)
+        reg = load_registry(path)
+        before = len(reg["entries"])
+        reg["entries"] = [e for e in reg["entries"] if registry_key(e) != addr]
+        save_registry(path, reg)
+        print(f"removed {addr}: {before - len(reg['entries'])} entry deleted")
+        return 0
+    if args.live or args.addr:
+        targets = []
+        if args.addr:
+            targets = [{"address": normalize(args.addr), "label": args.addr}]
+        else:
+            reg = load_registry(path)
+            targets = reg["entries"]
+        if not targets:
+            print("registry is empty; add entries with: claimradar.py registry --add <addr> --label ...")
+            return 0
+        print(f"{'balance ETH':>12}  {'address':<42}  label")
+        for e in targets:
+            bal = rpc_balance(config, e["address"])
+            label = (e.get("label") or e["address"])[:36]
+            print(f"{bal if bal is None else round(bal, 6):>12}  {e['address']:<42}  {label}")
+        return 0
+    if args.watch:
+        reg = load_registry(path)
+        if not reg["entries"]:
+            print("registry is empty; add entries with: claimradar.py registry --add <addr> --label ...")
+            return 1
+        prior = load_json(REGISTRY_STATE, {}).get("balances", {})
+        while True:
+            alerts = []
+            for e in reg["entries"]:
+                addr = e["address"]
+                label = e.get("label") or addr
+                min_delta = float(e.get("min_delta_eth", 0.01))
+                bal = rpc_balance(config, addr)
+                if bal is None:
+                    alerts.append(f"[registry] {label}: RPC unreachable, skipped")
+                    continue
+                prev = prior.get(addr)
+                if prev is None:
+                    alerts.append(f"[registry] {label}: baseline balance {bal:.6f} ETH")
+                else:
+                    delta = bal - prev
+                    if delta > min_delta:
+                        alerts.append(
+                            f"[registry] {label}: +{delta:.6f} ETH inbound funding "
+                            f"({prev:.6f} -> {bal:.6f})"
+                        )
+                    elif delta < -min_delta:
+                        alerts.append(
+                            f"[registry] {label}: -{abs(delta):.6f} ETH "
+                            f"({prev:.6f} -> {bal:.6f})"
+                        )
+                prior[addr] = bal
+            save_json(REGISTRY_STATE, {"balances": prior})
+            notify(alerts, notify_cmd=args.notify_cmd, quiet=args.quiet)
+            if not args.interval:
+                break
+            time.sleep(args.interval)
+        return 0
+    # default: list
+    reg = load_registry(path)
+    if not reg["entries"]:
+        print("registry is empty. Add declared-recovery addresses:")
+        print("  claimradar.py registry --add 0x... --label 'Public vault' --source <url> --type donation_designated")
+        return 0
+    print(f"{'address':<42}  {'type':<20} {'elig':<10} claim method")
+    for e in reg["entries"]:
+        print(
+            f"{e['address']:<42}  {(e.get('declaration_type') or ''):<20} "
+            f"{(e.get('eligibility') or ''):<10} {e.get('claim_method') or '-'}"
+        )
+        if e.get("label"):
+            print(f"{'':<42}  label: {e['label']}")
+        if e.get("source"):
+            print(f"{'':<42}  source: {e['source']}")
+        if e.get("note"):
+            print(f"{'':<42}  note: {e['note'][:120]}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — Open Claims: 'free unclaimed crypto' registry + scanner
+# ---------------------------------------------------------------------------
+
+DEFAULT_OPEN_CLAIMS = os.path.join(CONFIG_DIR, "open_claims.json")
+OPEN_STATE = os.path.join(CONFIG_DIR, "open_state.json")
+
+OPEN_CATEGORIES = {
+    "airdrop": "public airdrop/claim contract",
+    "bounty": "public bounty / prize pool",
+    "redemption": "public redemption / migration pool",
+    "burn_claim": "burn address with published claim path",
+    "public_vault": "publicly declared recovery vault",
+}
+
+# Seed pools are the real, on-chain-verified recovery mechanisms already in
+# this tool. Each is tagged 'designated': the caller must control the address
+# whose balance is being claimed. `open add` registers new pools you find with
+# public terms; `open scan` live-checks how much still sits in each pool.
+OPEN_CLAIM_DEFAULTS = {
+    "aave_v1": {
+        "name": "Aave v1 (aETH redeem)",
+        "contract": "0x3a3A65aAb0dd2A17E3F1947bA16138cd37d08c04",
+        "category": "redemption",
+        "eligibility": "designated",
+        "eligibility_note": "Caller must hold aETH shares (balanceOf).",
+        "read": {"method": "balanceOf(address)", "args": ["<address>"]},
+        "read_contract": "0x3a3A65aAb0dd2A17E3F1947bA16138cd37d08c04",
+        "claim_method": "redeem(uint256)",
+        "claim_args": ["<amount>"],
+        "unit": "aETH",
+        "terms_url": "https://github.com/q84c6tsm95-create/forgotten-eth",
+        "deadline": None,
+        "note": "Burn aETH shares for ETH. Stuck since Aave v1 shutdown.",
+    },
+    "etherdelta": {
+        "name": "EtherDelta v2 (ETH withdraw)",
+        "contract": "0x8d12A197cB00D4747a1fe03395095ce2A5CC6819",
+        "category": "redemption",
+        "eligibility": "designated",
+        "eligibility_note": "Caller must control the address with the deposit balance.",
+        "read": {"method": "balanceOf(address,address)", "args": ["0x0000000000000000000000000000000000000000", "<address>"]},
+        "read_contract": "0x8d12A197cB00D4747a1fe03395095ce2A5CC6819",
+        "claim_method": "withdraw(uint256)",
+        "claim_args": ["<amount>"],
+        "unit": "ETH",
+        "terms_url": "https://github.com/q84c6tsm95-create/forgotten-eth",
+        "deadline": None,
+        "note": "Withdraw ETH deposit balance from the defunct exchange contract.",
+    },
+    "idex_v1": {
+        "name": "IDEX v1 (ETH withdraw)",
+        "contract": "0x2a0c0DBEcC7E4D658f48E01e3fA353F44050c208",
+        "category": "redemption",
+        "eligibility": "designated",
+        "eligibility_note": "Caller must control the address with the deposit balance.",
+        "read": {"method": "balanceOf(address,address)", "args": ["0x0000000000000000000000000000000000000000", "<address>"]},
+        "read_contract": "0x2a0c0DBEcC7E4D658f48E01e3fA353F44050c208",
+        "claim_method": "withdraw(address,uint256)",
+        "claim_args": ["0x0000000000000000000000000000000000000000", "<amount>"],
+        "unit": "ETH",
+        "terms_url": "https://github.com/q84c6tsm95-create/forgotten-eth",
+        "deadline": None,
+        "note": "Withdraw ETH deposit balance from the defunct IDEX v1 Exchange.",
+    },
+}
+
+
+def load_open_claims(path):
+    doc = load_json(path, {"pools": dict(OPEN_CLAIM_DEFAULTS)})
+    doc.setdefault("pools", {})
+    for key, pool in OPEN_CLAIM_DEFAULTS.items():
+        doc["pools"].setdefault(key, pool)
+    return doc
+
+
+def open_pool_read_path(pool):
+    """Resolve a read path into (contract, data) for live balance checks."""
+    read = pool.get("read")
+    if not read:
+        return None
+    contract = pool.get("read_contract") or pool.get("contract")
+    method = read["method"]
+    args = [a for a in read.get("args", ["<address>"])]
+    if "<address>" in args:
+        return None
+    return contract, path_data(method, args)
+
+
+def open_pool_balance(config, pool):
+    """Live total balance held in a pool. Returns float in pool units, or None."""
+    rp = open_pool_read_path(pool)
+    if rp is None:
+        return None
+    contract, data = rp
+    try:
+        res = eth_call(config.get("rpc"), contract, data.hex())
+    except (RevertError, RuntimeError):
+        return None
+    return int(res, 16) / 1e18
+
+
+def cmd_open(args, config):
+    path = args.config or DEFAULT_OPEN_CLAIMS
+    doc = load_open_claims(path)
+    pools = doc["pools"]
+
+    if args.add:
+        key = args.add
+        if key in pools:
+            print(f"pool '{key}' already exists; remove it first or use a different key")
+            return 1
+        contract = normalize(args.contract or "")
+        if len(contract.removeprefix("0x")) != 40:
+            print("open add requires --contract <0x...>")
+            return 1
+        pools[key] = {
+            "name": args.name or key,
+            "contract": contract,
+            "category": args.category or "public_vault",
+            "eligibility": args.eligibility or "unknown",
+            "eligibility_note": args.eligibility_note or "",
+            "read": {"method": args.read_method or "balanceOf(address)", "args": [contract]} if args.read_method else None,
+            "read_contract": contract,
+            "claim_method": args.claim_method or "",
+            "claim_args": [],
+            "unit": args.unit or "units",
+            "terms_url": args.terms or "",
+            "deadline": args.deadline,
+            "note": args.note or "",
+        }
+        if args.category not in OPEN_CATEGORIES:
+            print(f"warning: unknown category '{args.category}' (known: {', '.join(sorted(OPEN_CATEGORIES))})")
+        if args.eligibility not in REGISTRY_ELIGIBILITY:
+            print(f"warning: unknown eligibility '{args.eligibility}' (known: {', '.join(REGISTRY_ELIGIBILITY)})")
+        save_json(path, doc)
+        print(f"added open-claim pool '{key}': {pools[key]['name']}")
+        return 0
+    if args.remove:
+        key = args.remove
+        if key not in pools:
+            print(f"unknown pool '{key}'")
+            return 1
+        del pools[key]
+        save_json(path, doc)
+        print(f"removed pool '{key}'")
+        return 0
+    if args.check:
+        key = args.check
+        pool = pools.get(key)
+        if not pool:
+            print(f"unknown pool '{key}'. Known: {', '.join(sorted(pools))}")
+            return 1
+        bal = open_pool_balance(config, pool)
+        print(f"pool:       {pool['name']} ({key})")
+        print(f"contract:   {pool['contract']}")
+        print(f"category:   {pool.get('category')}")
+        print(f"eligibility:{pool.get('eligibility')} — {pool.get('eligibility_note', '')}")
+        print(f"pool units: {bal if bal is None else round(bal, 4)} {pool.get('unit')}")
+        if pool.get("claim_method"):
+            print(f"claim:      {pool['claim_method']} on {pool['contract']}")
+        if pool.get("deadline"):
+            print(f"deadline:   {pool['deadline']}")
+        if pool.get("terms_url"):
+            print(f"terms:      {pool['terms_url']}")
+        if pool.get("note"):
+            print(f"note:       {pool['note']}")
+        return 0
+    if args.claim_pool:
+        key = args.claim_pool
+        pool = pools.get(key)
+        if not pool:
+            print(f"unknown pool '{key}'. Known: {', '.join(sorted(pools))}")
+            return 1
+        user = normalize(args.claim_address or "")
+        if len(user.removeprefix("0x")) != 40:
+            print("open claim requires --claim-address <your-wallet>")
+            return 1
+        elig = pool.get("eligibility", "unknown")
+        if elig != "open":
+            print(f"pool '{key}' is not open-to-anyone (eligibility={elig}).")
+            print(f"  {pool.get('eligibility_note', '')}")
+            if elig == "designated":
+                print("  -> you can only claim balances at addresses you control; use:")
+                print(f"     claimradar.py claim --protocol {key} --address {user}")
+            else:
+                print("  -> resolve the eligibility requirement (proof/designation) before claiming.")
+            return 1
+        method = pool.get("claim_method") or ""
+        if not method or "(" not in method:
+            print(f"pool '{key}' has no registered claim method")
+            return 1
+        amount_wei = int(args.amount * 1e18) if args.amount else None
+        if amount_wei is None:
+            bal = open_pool_balance(config, pool)
+            amount_wei = int((bal or 0) * 1e18)
+        if amount_wei <= 0:
+            print("pool balance is 0; nothing to claim")
+            return 0
+        args_claim = []
+        for a in pool.get("claim_args", []):
+            args_claim.append(user if a == "<address>" else amount_wei if a == "<amount>" else a)
+        data = path_data(method, args_claim)
+        print(f"open claim: {pool['name']} ({key})")
+        print(f"  contract:   {pool['contract']}")
+        print(f"  method:     {method}")
+        print(f"  amount:     {amount_wei} wei ({amount_wei / 1e18:.6f} {pool.get('unit')})")
+        print("  simulating eth_call...")
+        try:
+            eth_call(config.get("rpc"), pool["contract"], data.hex(), from_addr=user)
+            print("  eth_call OK (no revert)")
+        except RuntimeError as e:
+            print(f"  WARNING: {e}")
+        tx = build_unsigned(config, pool["contract"], method, args_claim, user)
+        print()
+        print("unsigned EIP-1559 transaction (sign offline; never expose your private key):")
+        print(json.dumps(tx, indent=2))
+        return 0
+    if args.watch:
+        if not pools:
+            print("no pools registered")
+            return 1
+        prior = load_json(OPEN_STATE, {}).get("balances", {})
+        while True:
+            alerts = []
+            for key, pool in sorted(pools.items()):
+                bal = open_pool_balance(config, pool)
+                prev = prior.get(key)
+                if bal is None:
+                    continue
+                if prev is None:
+                    alerts.append(f"[open] {key} baseline balance {bal:.4f} {pool.get('unit')}")
+                else:
+                    delta = bal - prev
+                    if abs(delta) >= 1e-9:
+                        alerts.append(
+                            f"[open] {key} {'+' if delta > 0 else ''}{delta:.4f} {pool.get('unit')} "
+                            f"({prev:.4f} -> {bal:.4f})"
+                        )
+                prior[key] = bal
+            save_json(OPEN_STATE, {"balances": prior})
+            notify(alerts, notify_cmd=args.notify_cmd, quiet=args.quiet)
+            if not args.interval:
+                break
+            time.sleep(args.interval)
+        return 0
+    # default: scan / list
+    if args.json:
+        rows = []
+        for key, pool in sorted(pools.items()):
+            bal = open_pool_balance(config, pool)
+            rows.append({
+                "pool": key,
+                "name": pool["name"],
+                "contract": pool["contract"],
+                "category": pool.get("category"),
+                "eligibility": pool.get("eligibility"),
+                "balance": bal,
+                "unit": pool.get("unit"),
+                "deadline": pool.get("deadline"),
+            })
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not pools:
+        print("no open-claim pools registered. Add one with:")
+        print("  claimradar.py open add <key> --contract 0x... --name '...' --eligibility open")
+        return 0
+    print(f"{'pool':<14} {'balance':>12} {'unit':<8} {'elig':<10} {'deadline':<12} name")
+    for key, pool in sorted(pools.items()):
+        bal = open_pool_balance(config, pool)
+        bal_str = "-" if bal is None else f"{bal:.4f}"
+        print(
+            f"{key:<14} {bal_str:>12} {pool.get('unit', ''):<8} "
+            f"{pool.get('eligibility', ''):<10} {str(pool.get('deadline') or '-'):<12} {pool['name'][:34]}"
+        )
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Claim Radar — check Ethereum addresses against the ForgottenETH public recovery index."
@@ -985,6 +1456,57 @@ def main():
     mi.add_argument("--top", type=int, default=0, help="scan the top-N addresses by mapped balance")
     mi.add_argument("--min", type=float, default=0.0, help="min mapped balance to include in scan")
     mi.add_argument("--config", default=DEFAULT_CONFIG)
+
+    rg = sub.add_parser(
+        "registry",
+        help="track donation/declared-recovery addresses (public offers) and watch them",
+    )
+    rg.add_argument("--add", metavar="ADDR", help="add an entry to the registry")
+    rg.add_argument("--label", default="", help="human label for the declared address")
+    rg.add_argument("--type", default="donation_designated", help="declaration type")
+    rg.add_argument("--source", default="", help="URL or reference to the public declaration/terms")
+    rg.add_argument("--claim-method", default="", help="on-chain claim function, if published (e.g. claim(uint256))")
+    rg.add_argument("--eligibility", default="unknown", help="who may claim: open, proof, designated, unknown")
+    rg.add_argument("--note", default="", help="free-form note")
+    rg.add_argument("--min-delta", type=float, default=0.01, help="min ETH delta to alert on in watch mode")
+    rg.add_argument("--remove", metavar="ADDR", help="remove an entry from the registry")
+    rg.add_argument("--live", action="store_true", help="show live on-chain ETH balance of each entry")
+    rg.add_argument("--addr", metavar="ADDR", help="live-check a single declared address")
+    rg.add_argument("--export", metavar="FILE", help="export the registry as JSON")
+    rg.add_argument("--watch", action="store_true", help="poll declared-address balances and alert on funding changes")
+    rg.add_argument("--interval", type=int, default=0, help="watch loop interval in seconds (0 = run once)")
+    rg.add_argument("--notify-cmd", default="", help="shell command template; {message} and {ts} are substituted")
+    rg.add_argument("--quiet", action="store_true", help="only log, don't print alerts")
+    rg.add_argument("--config", default=DEFAULT_REGISTRY)
+
+    op = sub.add_parser(
+        "open",
+        help="free-unclaimed / open public claim pools: scan, check, claim, watch",
+    )
+    op.add_argument("--add", metavar="KEY", help="register a new open-claim pool")
+    op.add_argument("--name", default="", help="display name for the pool")
+    op.add_argument("--contract", default="", help="pool contract address")
+    op.add_argument("--category", default="public_vault", help="airdrop, bounty, redemption, burn_claim, public_vault")
+    op.add_argument("--eligibility", default="unknown", help="who may claim: open, proof, designated, unknown")
+    op.add_argument("--eligibility-note", default="", help="plain-text eligibility requirement")
+    op.add_argument("--read-method", default="", help="read method for pool balance (default balanceOf(address))")
+    op.add_argument("--claim-method", default="", help="claim method, e.g. claim(uint256)")
+    op.add_argument("--unit", default="units", help="unit name for the pool balance")
+    op.add_argument("--terms", default="", help="URL to public terms/declaration")
+    op.add_argument("--deadline", default="", help="claim deadline, e.g. 2026-12-31")
+    op.add_argument("--note", default="", help="free-form note")
+    op.add_argument("--remove", metavar="KEY", help="remove a registered pool")
+    op.add_argument("--check", metavar="KEY", help="show detailed state of one pool")
+    op.add_argument("--scan", dest="scan", action="store_true", help="live-scan all pools (default when no sub-action)")
+    op.add_argument("--json", action="store_true", help="JSON output for the default scan")
+    op.add_argument("--claim-pool", metavar="KEY", help="build an unsigned claim tx for an open pool")
+    op.add_argument("--claim-address", default="", help="your wallet address for the claim tx")
+    op.add_argument("--amount", type=float, default=None, help="claim amount in pool units (default: full pool)")
+    op.add_argument("--watch", action="store_true", help="poll pool balances and alert on changes")
+    op.add_argument("--interval", type=int, default=0, help="watch loop interval in seconds (0 = run once)")
+    op.add_argument("--notify-cmd", default="", help="shell command template; {message} and {ts} are substituted")
+    op.add_argument("--quiet", action="store_true", help="only log, don't print alerts")
+    op.add_argument("--config", default=DEFAULT_OPEN_CLAIMS)
 
     ap.add_argument("--guide", action="store_true", help="print the plain-English usage guide and exit")
 
@@ -1055,6 +1577,12 @@ def main():
     elif args.cmd == "migrate":
         config = load_json(args.config, default_config())
         sys.exit(cmd_migrate(args, config))
+    elif args.cmd == "registry":
+        config = load_json(DEFAULT_CONFIG, default_config())
+        sys.exit(cmd_registry(args, config))
+    elif args.cmd == "open":
+        config = load_json(DEFAULT_CONFIG, default_config())
+        sys.exit(cmd_open(args, config))
 
 
 if __name__ == "__main__":
