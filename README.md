@@ -188,6 +188,8 @@ e.g. 10,999 ANTv1 (`0x893608…7cb8`) and 25,000 ANTv1 (`0x41f89c…5f92c`) stil
 
 ## Quick Start
 
+New to Claim Radar? Read the plain-English guide first: **[USAGE.md](USAGE.md)**.
+
 ```bash
 pip install requests
 python -m btc_tools.cli known                      # List 10 known dormant addresses
