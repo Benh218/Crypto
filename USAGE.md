@@ -18,6 +18,7 @@ your private keys, and every transaction it outputs is unsigned (you sign it you
 | `claim --protocol X` | Build a simulated, unsigned recovery tx | JSON tx to sign yourself |
 | `registry` | Track donation/declared-recovery addresses & alert on funding | live balances + alerts |
 | `open` | Free-unclaimed/open public claim pools: scan, check, claim | pool balances + unsigned claim tx |
+| `claimcheck` | Track live claim/airdrop windows with deadlines | windows + days-left + closing-soon alerts |
 
 ## Setup
 
@@ -119,6 +120,28 @@ python claim_radar.py open --watch --interval 300  # alert when a pool's balance
 Honest limit: genuinely "anyone can claim" pools are rare. If a pool is `designated` or `proof`,
 the tool tells you what's required instead of pretending it's claimable — it never generates a
 transaction that would take someone else's funds.
+
+### 8. Don't miss live claim/airdrop windows
+
+`claimcheck` tracks public claim windows (airdrops, migrations, redemption deadlines) so a window
+that silently expires doesn't slip past you. It ships pre-seeded with live windows from a public
+tracker (Warden Protocol, Superform, Infinex, Pharos, …); entries show eligibility + days left,
+and watch mode alerts as deadlines approach.
+
+```bash
+python claim_radar.py claimcheck                        # all tracked windows + days left
+python claim_radar.py claimcheck --check warden_protocol  # detail on one window
+python claim_radar.py claimcheck --address 0xYourWallet    # windows that may apply to you
+python claim_radar.py claimcheck --watch --soon-days 7     # alert when <=7 days remain (cron)
+python claim_radar.py claimcheck --add mywin --name '...' \
+  --claim-url 'https://official-claim-site' --deadline 2026-12-31 --type airdrop
+```
+
+Honest limit: nearly every airdrop requires *proof of ownership* — you connect/control the target
+address and claim on the project's official site. `claimcheck` is a reminder + tracker, not a
+keyless claimer. Where a window is genuinely open-to-anyone, register it in `open` (step 7) and it
+becomes claimable there. Reference links point at the tracking source; always confirm terms at the
+project's own site before acting.
 
 ## Real findings from development scans
 

@@ -214,11 +214,18 @@ Commands (run: python claimradar.py <command> --help):
                   registry --add 0x... --label 'vault' --source <url>; --live
                   shows current balances; watch mode alerts on funding
   open            free-unclaimed / open public claim pools: scan, check, claim
-                  open (default scan) live-reads each pool's balance;
-                  open check <key> shows terms + eligibility;
-                  open claim --claim-pool <key> --claim-address 0x... builds
-                  an unsigned claim tx for pools tagged eligibility=open;
-                  open add registers a new pool you found with public terms
+                   open (default scan) live-reads each pool's balance;
+                   open check <key> shows terms + eligibility;
+                   open claim --claim-pool <key> --claim-address 0x... builds
+                   an unsigned claim tx for pools tagged eligibility=open;
+                   open add registers a new pool you found with public terms
+  claimcheck      track live claim/airdrop windows with deadlines and alerts
+                   claimcheck (default) lists tracked windows + days left;
+                   claimcheck --watch --soon-days 7 alerts when a window is
+                   closing (run in cron); claimcheck --address 0x... prints
+                   the windows that may apply to you (reminder only);
+                   claimcheck --add <key> --name ... --deadline 2026-12-31
+                   registers a new window you found
 
 Quick start:
   1. python claimradar.py check 0xYourAddress --detail   # do you have anything?
@@ -226,6 +233,7 @@ Quick start:
   3. python claimradar.py sweep --top 300 --min 1        # claimable right now
   4. python claimradar.py claim --protocol <name> --address 0x...  # build tx
   5. Sign the JSON in your wallet and broadcast.
+  6. python claimradar.py claimcheck --watch --soon-days 7  # don't miss windows
   Optional: python claimradar.py watch --init && cron every 10 min.
 
 Safety:
@@ -1189,6 +1197,321 @@ OPEN_CLAIM_DEFAULTS = {
 }
 
 
+DEFAULT_CLAIMCHECK = os.path.join(CONFIG_DIR, "claimcheck.json")
+CLAIMCHECK_STATE = os.path.join(CONFIG_DIR, "claimcheck_state.json")
+
+CLAIMCHECK_TYPES = {
+    "airdrop": "token airdrop / allocation claim",
+    "bounty": "public bounty / prize pool",
+    "redemption": "migration / redemption pool",
+    "stake_reward": "staking reward claim",
+    "misc": "other publicly declared claim",
+}
+
+# Live claim opportunities as of 2026-08. Reference links point at the public
+# aggregator page that named each program; always confirm eligibility + terms at
+# the project's own site before acting. These are tracked because claim windows
+# silently expire — the tool's job is to not let you miss one you were due.
+# eligibility is almost always 'proof' (you must connect/control the address),
+# so `claimcheck --address` cannot mint a tx for them; it only reminds + verifies.
+CLAIMCHECK_DEFAULTS = {
+    "warden_protocol": {
+        "name": "Warden Protocol",
+        "type": "airdrop",
+        "chain": "",
+        "claim_url": "https://airdrops.io/warden-protocol/",
+        "deadline": "2026-08-09",
+        "deadline_est": True,
+        "eligibility": "proof",
+        "note": "Claim Now window closing in days.",
+    },
+    "superform_labs": {
+        "name": "Superform Labs",
+        "type": "airdrop",
+        "chain": "",
+        "claim_url": "https://airdrops.io/superform-labs/",
+        "deadline": "2026-08-14",
+        "deadline_est": True,
+        "eligibility": "proof",
+        "note": "Claim Now window.",
+    },
+    "infinex": {
+        "name": "Infinex",
+        "type": "airdrop",
+        "chain": "",
+        "claim_url": "https://airdrops.io/infinex/",
+        "deadline": "2027-02-04",
+        "deadline_est": True,
+        "eligibility": "proof",
+        "note": "Long claim window (multi-month).",
+    },
+    "ethgas": {
+        "name": "ETHGAS",
+        "type": "airdrop",
+        "chain": "",
+        "claim_url": "https://airdrops.io/ethgas/",
+        "deadline": "",
+        "deadline_est": True,
+        "eligibility": "proof",
+        "note": "Claim Now; no stated deadline.",
+    },
+    "grvt": {
+        "name": "GRVT",
+        "type": "airdrop",
+        "chain": "",
+        "claim_url": "https://airdrops.io/grvt/",
+        "deadline": "",
+        "deadline_est": True,
+        "eligibility": "proof",
+        "note": "Claim Now.",
+    },
+    "arcium": {
+        "name": "Arcium",
+        "type": "airdrop",
+        "chain": "",
+        "claim_url": "https://airdrops.io/arcium/",
+        "deadline": "",
+        "deadline_est": True,
+        "eligibility": "proof",
+        "note": "Check eligibility and claim.",
+    },
+    "pharos": {
+        "name": "Pharos",
+        "type": "airdrop",
+        "chain": "",
+        "claim_url": "https://airdrops.io/pharos/",
+        "deadline": "2026-10-25",
+        "deadline_est": False,
+        "eligibility": "proof",
+        "note": "Connect wallet and claim SLX-like allocation; window ends Oct 25 2026.",
+    },
+    "solstice": {
+        "name": "Solstice",
+        "type": "airdrop",
+        "chain": "",
+        "claim_url": "https://airdrops.io/solstice/",
+        "deadline": "",
+        "deadline_est": True,
+        "eligibility": "proof",
+        "note": "Connect wallet to claim SLX.",
+    },
+    "basedapp": {
+        "name": "BasedApp",
+        "type": "airdrop",
+        "chain": "",
+        "claim_url": "https://airdrops.io/basedapp/",
+        "deadline": "",
+        "deadline_est": True,
+        "eligibility": "proof",
+        "note": "Connect wallet to check allocation.",
+    },
+    "plume": {
+        "name": "Plume Network",
+        "type": "airdrop",
+        "chain": "",
+        "claim_url": "https://airdrops.io/plume-network/",
+        "deadline": "",
+        "deadline_est": True,
+        "eligibility": "proof",
+        "note": "Connect wallet and claim.",
+    },
+    "nexus": {
+        "name": "Nexus",
+        "type": "airdrop",
+        "chain": "",
+        "claim_url": "https://airdrops.io/nexus/",
+        "deadline": "",
+        "deadline_est": True,
+        "eligibility": "proof",
+        "note": "Connect wallet to check allocation.",
+    },
+    "deepbook": {
+        "name": "DeepBook",
+        "type": "airdrop",
+        "chain": "",
+        "claim_url": "https://airdrops.io/deepbook/",
+        "deadline": "",
+        "deadline_est": True,
+        "eligibility": "proof",
+        "note": "Join waitlist and claim DEEP.",
+    },
+    "jupiter": {
+        "name": "Jupiter",
+        "type": "stake_reward",
+        "chain": "",
+        "claim_url": "https://airdrops.io/jupiter/",
+        "deadline": "",
+        "deadline_est": True,
+        "eligibility": "proof",
+        "note": "Ongoing rounds; stake JUP for rewards.",
+    },
+    "satsuma": {
+        "name": "Satsuma",
+        "type": "airdrop",
+        "chain": "",
+        "claim_url": "https://airdrops.io/satsuma/",
+        "deadline": "",
+        "deadline_est": True,
+        "eligibility": "proof",
+        "note": "Connect wallet and check eligibility.",
+    },
+    "aiw3": {
+        "name": "AIW3",
+        "type": "airdrop",
+        "chain": "",
+        "claim_url": "https://airdrops.io/aiw3/",
+        "deadline": "",
+        "deadline_est": True,
+        "eligibility": "proof",
+        "note": "Check eligibility.",
+    },
+}
+
+
+def load_claimchecks(path):
+    doc = load_json(path, {"claims": dict(CLAIMCHECK_DEFAULTS)})
+    doc.setdefault("claims", {})
+    for key, claim in CLAIMCHECK_DEFAULTS.items():
+        doc["claims"].setdefault(key, claim)
+    return doc
+
+
+def claim_days_until(deadline):
+    if not deadline:
+        return None
+    try:
+        d = datetime.strptime(deadline, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return (d - datetime.now(timezone.utc).date()).days
+
+
+def cmd_claimcheck(args, config):
+    path = args.config or DEFAULT_CLAIMCHECK
+    doc = load_claimchecks(path)
+    claims = doc["claims"]
+
+    if args.add:
+        key = args.add
+        if key in claims:
+            print(f"claim '{key}' already exists; remove it first or use a different key")
+            return 1
+        claims[key] = {
+            "name": args.name or key,
+            "type": args.type or "airdrop",
+            "chain": args.chain,
+            "claim_url": args.claim_url,
+            "deadline": args.deadline,
+            "deadline_est": args.deadline_est,
+            "eligibility": args.eligibility or "proof",
+            "note": args.note or "",
+        }
+        if args.type not in CLAIMCHECK_TYPES:
+            print(f"warning: unknown type '{args.type}' (known: {', '.join(sorted(CLAIMCHECK_TYPES))})")
+        if args.eligibility not in REGISTRY_ELIGIBILITY:
+            print(f"warning: unknown eligibility '{args.eligibility}' (known: {', '.join(REGISTRY_ELIGIBILITY)})")
+        save_json(path, doc)
+        print(f"added claim window '{key}': {claims[key]['name']}")
+        return 0
+    if args.remove:
+        key = args.remove
+        if key not in claims:
+            print(f"unknown claim '{key}'")
+            return 1
+        del claims[key]
+        save_json(path, doc)
+        print(f"removed claim '{key}'")
+        return 0
+    if args.check:
+        key = args.check
+        claim = claims.get(key)
+        if not claim:
+            print(f"unknown claim '{key}'. Known: {', '.join(sorted(claims))}")
+            return 1
+        days = claim_days_until(claim.get("deadline"))
+        print(f"claim:      {claim['name']} ({key})")
+        print(f"type:       {claim.get('type')} — {CLAIMCHECK_TYPES.get(claim.get('type'), '')}")
+        if claim.get("chain"):
+            print(f"chain:      {claim['chain']}")
+        print(f"eligibility:{claim.get('eligibility')}")
+        print(f"deadline:   {claim.get('deadline') or 'not stated'}"
+              + (f" (~{days} days)" if days is not None else "")
+              + ("  [estimate]" if claim.get("deadline_est") else ""))
+        if claim.get("claim_url"):
+            print(f"claim at:   {claim['claim_url']}")
+        if claim.get("note"):
+            print(f"note:       {claim['note']}")
+        print("  -> connect/control the target address and follow the official site's claim flow.")
+        return 0
+    if args.address:
+        addr = normalize(args.address)
+        if len(addr.removeprefix("0x")) != 40:
+            print("claimcheck --address expects a 0x-address")
+            return 1
+        print(f"claim windows that may apply to {addr}:")
+        for key, claim in sorted(claims.items()):
+            days = claim_days_until(claim.get("deadline"))
+            status = ""
+            if days is not None:
+                status = f"  ({days} days left)" if days >= 0 else "  (window may have passed)"
+            print(f"  {key:<16} {claim['name']}")
+            print(f"    type {claim.get('type')} | eligibility {claim.get('eligibility')} | deadline {claim.get('deadline') or '-'}{status}")
+            if claim.get("claim_url"):
+                print(f"    verify + claim: {claim['claim_url']}")
+        print()
+        print("NOTE: these require proof of ownership at claim time (connect wallet).")
+        print("Claim Radar does not hold or request your private key — you sign via the official UI.")
+        return 0
+    if args.watch:
+        prior = load_json(CLAIMCHECK_STATE, {}).get("seen", {})
+        seen = dict(prior)
+        while True:
+            alerts = []
+            today = datetime.now(timezone.utc).date().isoformat()
+            for key, claim in sorted(claims.items()):
+                if key not in seen:
+                    alerts.append(f"[claim] new window: {claim['name']} ({key}) — {claim.get('claim_url') or 'no link'}")
+                days = claim_days_until(claim.get("deadline"))
+                if days is not None and 0 <= days <= args.soon_days:
+                    flags = " (estimate)" if claim.get("deadline_est") else ""
+                    alerts.append(f"[claim] {claim['name']} ({key}) closing soon: ~{days} days (deadline {claim['deadline']}){flags}")
+                elif days is not None and days < 0 and seen.get(key) != "passed":
+                    alerts.append(f"[claim] {claim['name']} ({key}) deadline passed ({claim['deadline']}); verify it is truly closed")
+                seen[key] = "passed" if (days is not None and days < 0) else today
+            save_json(CLAIMCHECK_STATE, {"seen": seen})
+            notify(alerts, notify_cmd=args.notify_cmd, quiet=args.quiet)
+            if not args.interval:
+                break
+            time.sleep(args.interval)
+        return 0
+    if args.json:
+        rows = []
+        for key, claim in sorted(claims.items()):
+            days = claim_days_until(claim.get("deadline"))
+            row = dict(claim)
+            row["key"] = key
+            row["days_left"] = days
+            rows.append(row)
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not claims:
+        print("no claim windows registered. Add one with:")
+        print("  claimradar.py claimcheck add <key> --name '...' --claim-url https://...")
+        return 0
+    print(f"{'claim':<16} {'days':>5} {'elig':<10} {'type':<11} {'deadline':<12} name")
+    for key, claim in sorted(claims.items()):
+        days = claim_days_until(claim.get("deadline"))
+        days_str = "-" if days is None else (f"{days}" if days >= 0 else "PASSED")
+        est = "*" if claim.get("deadline_est") else " "
+        print(
+            f"{key:<16} {days_str:>5}{est} {claim.get('eligibility', ''):<10} "
+            f"{claim.get('type', ''):<11} {str(claim.get('deadline') or '-'):<12} {claim['name'][:34]}"
+        )
+    print()
+    print("* approximate deadline from the tracking source")
+    return 0
+
+
 def load_open_claims(path):
     doc = load_json(path, {"pools": dict(OPEN_CLAIM_DEFAULTS)})
     doc.setdefault("pools", {})
@@ -1508,6 +1831,30 @@ def main():
     op.add_argument("--quiet", action="store_true", help="only log, don't print alerts")
     op.add_argument("--config", default=DEFAULT_OPEN_CLAIMS)
 
+    cc = sub.add_parser(
+        "claimcheck",
+        help="track live claim/airdrop windows: deadlines, alerts, per-address reminders",
+    )
+    cc.add_argument("--add", metavar="KEY", help="register a new claim window")
+    cc.add_argument("--name", default="", help="display name for the claim window")
+    cc.add_argument("--type", default="airdrop", help="airdrop, bounty, redemption, stake_reward, misc")
+    cc.add_argument("--chain", default="", help="chain, e.g. Ethereum, Arbitrum, Solana")
+    cc.add_argument("--claim-url", default="", help="official/aggregator URL where the claim happens")
+    cc.add_argument("--deadline", default="", help="claim deadline, e.g. 2026-12-31")
+    cc.add_argument("--deadline-est", action="store_true", help="deadline is approximate from the tracking source")
+    cc.add_argument("--eligibility", default="proof", help="who may claim: open, proof, designated, unknown")
+    cc.add_argument("--note", default="", help="free-form note")
+    cc.add_argument("--remove", metavar="KEY", help="remove a registered claim window")
+    cc.add_argument("--check", metavar="KEY", help="show detailed state of one claim window")
+    cc.add_argument("--address", default="", help="0x-address to list applicable windows for (reminder only)")
+    cc.add_argument("--json", action="store_true", help="JSON output for the default listing")
+    cc.add_argument("--watch", action="store_true", help="poll windows and alert on deadlines + new entries")
+    cc.add_argument("--interval", type=int, default=0, help="watch loop interval in seconds (0 = run once)")
+    cc.add_argument("--soon-days", type=int, default=7, help="alert when a window has <= this many days left")
+    cc.add_argument("--notify-cmd", default="", help="shell command template; {message} and {ts} are substituted")
+    cc.add_argument("--quiet", action="store_true", help="only log, don't print alerts")
+    cc.add_argument("--config", default=DEFAULT_CLAIMCHECK)
+
     ap.add_argument("--guide", action="store_true", help="print the plain-English usage guide and exit")
 
     if "--guide" in sys.argv:
@@ -1583,6 +1930,9 @@ def main():
     elif args.cmd == "open":
         config = load_json(DEFAULT_CONFIG, default_config())
         sys.exit(cmd_open(args, config))
+    elif args.cmd == "claimcheck":
+        config = load_json(DEFAULT_CONFIG, default_config())
+        sys.exit(cmd_claimcheck(args, config))
 
 
 if __name__ == "__main__":

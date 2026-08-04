@@ -245,6 +245,36 @@ IDEX v1), honestly tagged `designated` — they require controlling the balance'
 them (airdrop trackers, bounty vaults, public redemption contracts). Eligibility is labelled per
 pool, and `open claim` refuses to build a tx unless the pool is genuinely open.
 
+## Claim Radar Live Claim Tracker (Phase 5c)
+
+The `claimcheck` command tracks **live claim/airdrop windows** so a window that silently expires
+never slips past you. It ships pre-seeded with live opportunities from a public tracker (Warden
+Protocol, Superform Labs, Infinex, Pharos, …), each showing eligibility, deadline, and days left.
+Watch mode alerts as deadlines approach.
+
+```bash
+# All tracked windows + days left (* = approximate deadline)
+python claim_radar.py claimcheck
+
+# Detail on one window
+python claim_radar.py claimcheck --check warden_protocol
+
+# Windows that may apply to an address (reminder only)
+python claim_radar.py claimcheck --address 0xYourWallet
+
+# Alert when a window has <= 7 days left (cron-friendly; state in ~/.claim_radar/)
+python claim_radar.py claimcheck --watch --soon-days 7
+
+# Register a window you found
+python claim_radar.py claimcheck --add mywin --name '...' \
+  --claim-url 'https://official-claim-site' --deadline 2026-12-31 --type airdrop
+```
+
+Honest limit: nearly every airdrop requires **proof of ownership** — you connect the target
+address and claim on the project's official site. `claimcheck` is a reminder/tracker, not a
+keyless claimer. If a window is genuinely open-to-anyone, register it in `open` (Phase 5b) where
+it becomes claimable.
+
 ## Quick Start
 
 New to Claim Radar? Read the plain-English guide first: **[USAGE.md](USAGE.md)**.
